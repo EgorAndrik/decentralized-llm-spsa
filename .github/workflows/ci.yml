@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      # CPU-only torch keeps the install small; the tests do not need a GPU.
+      - run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q -p no:cacheprovider tests
+        env:
+          # No secrets in CI; the tests use stub clients and never call a provider.
+          LLM_MAX_CALLS: "0"

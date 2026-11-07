@@ -1,4 +1,15 @@
-# llm_config_example.py — скопируйте в llm_config.py и вставьте свои ключи
+# llm_config_example.py — скопируйте в llm_config.py (файл в .gitignore)
+#
+# КЛЮЧИ ЛУЧШЕ НЕ ХРАНИТЬ В ФАЙЛЕ: задайте их переменными окружения, они имеют
+# приоритет над значениями ниже. Имя модели переводится в верхний регистр, всё
+# кроме букв и цифр заменяется на «_»:
+#   export LLM_API_KEY_LLAMA3_8B_INSTRUCT=...      # ключ одной модели
+#   export LLM_API_KEY=...                         # ключ OpenRouter: только для моделей на openrouter.ai
+#                                                  # (другим провайдерам он не отправляется)
+# Ключ отправляется только на https-адреса из списка разрешённых хостов
+# (openrouter.ai, api.groq.com, api.together.xyz, api.deepseek.com, api.mistral.ai,
+# api.openai.com) или на http://localhost. Другой хост: export LLM_ALLOWED_HOSTS=host1,host2
+# Потолок платных запросов: export LLM_MAX_CALLS=2000 (или --max-api-calls).
 #
 # Выберите один из двух вариантов (или смешайте):
 #   ВАРИАНТ А — OpenRouter: один ключ, все модели

@@ -22,6 +22,8 @@ from . import real_benchmarks
 
 
 ENCODER = "sentence-transformers/all-MiniLM-L6-v2"
+# Pinned commit of the encoder weights (head observed on 2026-11-05).
+ENCODER_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 ENCODER_MAX_TOKENS = 256
 KNN_NEIGHBOURS = 10
 # RouterBench's MLP router, fixed before any run: one hidden layer, early
@@ -70,7 +72,7 @@ def encode(benchmark: str, root: Path = real_benchmarks.EXTERNAL, batch_size: in
         return pd.read_parquet(path)
     from sentence_transformers import SentenceTransformer
     items, _ = real_benchmarks.load(benchmark, root)
-    model = SentenceTransformer(ENCODER, device="cpu")
+    model = SentenceTransformer(ENCODER, device="cpu", revision=ENCODER_REVISION)
     model.max_seq_length = ENCODER_MAX_TOKENS
     vectors = model.encode(items["prompt"].astype(str).tolist(), batch_size=batch_size,
                            normalize_embeddings=True, show_progress_bar=True,

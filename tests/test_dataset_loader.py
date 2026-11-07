@@ -20,6 +20,7 @@ from pathlib import Path
 # Ensure src/ is importable when running as `python -m pytest` from repo root.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src import dataset_loader
 from src.dataset_loader import get_task_pool, _POOL_CACHE, _HF_CACHE, _DATA_ROOT
 
 _MBPP = _DATA_ROOT / "mbpp.jsonl"
@@ -55,9 +56,9 @@ from src.run_spsa_comparison import generate_tasks, SCENARIO_TEMPLATES
 def _hf_cached(name: str) -> bool:
     """Return True if the HuggingFace cache JSON for *name* exists."""
     mapping = {
-        "SUMMARIZATION": "xsum_documents.json",
-        "TRANSLATION":   "opus100_sentences.json",
-        "TOOL_USE":      "hermes_fc_queries.json",
+        "SUMMARIZATION": dataset_loader.XSUM_CACHE,
+        "TRANSLATION":   dataset_loader.OPUS100_CACHE,
+        "TOOL_USE":      dataset_loader.HERMES_CACHE,
     }
     fname = mapping.get(name)
     return fname is not None and (_HF_CACHE / fname).exists()

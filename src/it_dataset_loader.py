@@ -64,12 +64,12 @@ class ITTaskRecord:
 DATASET_SOURCES: dict[ITSkill, DatasetSource] = {
     # Retained for reproducibility of the rejected draft only: 14 unique
     # prompts were observed, so this source is not scientifically usable.
-    ITSkill.FRONTEND: DatasetSource(ITSkill.FRONTEND, "xlelords/vulcan", "train", "MIT", "https://huggingface.co/datasets/xlelords/vulcan"),
-    ITSkill.BACKEND_API: DatasetSource(ITSkill.BACKEND_API, "glaiveai/glaive-function-calling-v2", "train", "Apache-2.0", "https://huggingface.co/datasets/glaiveai/glaive-function-calling-v2"),
-    ITSkill.DATABASES: DatasetSource(ITSkill.DATABASES, "b-mc2/sql-create-context", "train", "CC-BY-4.0", "https://huggingface.co/datasets/b-mc2/sql-create-context"),
-    ITSkill.ML_LLM: DatasetSource(ITSkill.ML_LLM, "xlangai/DS-1000", "test", "CC-BY-SA-4.0", "https://huggingface.co/datasets/xlangai/DS-1000"),
-    ITSkill.DEVOPS_CLOUD: DatasetSource(ITSkill.DEVOPS_CLOUD, "Skilln/devops-qa-dataset", "train", "CC-BY-SA-4.0", "https://huggingface.co/datasets/Skilln/devops-qa-dataset", data_file="hf://datasets/Skilln/devops-qa-dataset/devops_dataset.parquet"),
-    ITSkill.SECURITY: DatasetSource(ITSkill.SECURITY, "Trendyol/Trendyol-Cybersecurity-Instruction-Tuning-Dataset", "train", "Apache-2.0", "https://huggingface.co/datasets/Trendyol/Trendyol-Cybersecurity-Instruction-Tuning-Dataset"),
+    ITSkill.FRONTEND: DatasetSource(ITSkill.FRONTEND, "xlelords/vulcan", "train", "MIT", "https://huggingface.co/datasets/xlelords/vulcan", revision="19d2a482c78554e59feca0ce2b50fb7835e90c6f"),
+    ITSkill.BACKEND_API: DatasetSource(ITSkill.BACKEND_API, "glaiveai/glaive-function-calling-v2", "train", "Apache-2.0", "https://huggingface.co/datasets/glaiveai/glaive-function-calling-v2", revision="e7f4b6456019f5d8bcb991ef0dd67d8ff23221ac"),
+    ITSkill.DATABASES: DatasetSource(ITSkill.DATABASES, "b-mc2/sql-create-context", "train", "CC-BY-4.0", "https://huggingface.co/datasets/b-mc2/sql-create-context", revision="9d80a6a118b838d9defc3798d659a54a2ac2ff37"),
+    ITSkill.ML_LLM: DatasetSource(ITSkill.ML_LLM, "xlangai/DS-1000", "test", "CC-BY-SA-4.0", "https://huggingface.co/datasets/xlangai/DS-1000", revision="4416080ac5cb80bdf7576aefb8f9a0b4d5426a44"),
+    ITSkill.DEVOPS_CLOUD: DatasetSource(ITSkill.DEVOPS_CLOUD, "Skilln/devops-qa-dataset", "train", "CC-BY-SA-4.0", "https://huggingface.co/datasets/Skilln/devops-qa-dataset", data_file="hf://datasets/Skilln/devops-qa-dataset@ef888f1d0c8122ee51ed13bd0f90b5f7ef05c64b/devops_dataset.parquet"),
+    ITSkill.SECURITY: DatasetSource(ITSkill.SECURITY, "Trendyol/Trendyol-Cybersecurity-Instruction-Tuning-Dataset", "train", "Apache-2.0", "https://huggingface.co/datasets/Trendyol/Trendyol-Cybersecurity-Instruction-Tuning-Dataset", revision="357544e7576607d88eaeac9b0adb07e9fd8bb2bb"),
 }
 
 

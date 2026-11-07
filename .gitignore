@@ -73,8 +73,9 @@ catboost_info/
 # Personal assistant memory
 .claude/
 
-# GitHub Copilot internal config (not for publication)
-.github/
+# GitHub Copilot internal config (not for publication); workflows are published
+.github/*
+!.github/workflows/
 
 # Internal working / reviewer notes (not for publication)
 FIXES_FOR_REVIEWER_CONCERNS.md
@@ -98,6 +99,7 @@ paper_experiment_outputs*/
 !figures/*.png
 # Figure caches, rebuilt by src.report_figures
 figures/data/*.pkl
+figures/data/*.parquet
 
 # Real-benchmark runs the report does not use (superseded or exploratory)
 real_benchmark_outputs/atc/

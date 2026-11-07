@@ -25,7 +25,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hashlib
+import io
 import json
+import logging
+import os
+import pickle
 import re
 from pathlib import Path
 
@@ -33,16 +38,20 @@ import numpy as np
 import pandas as pd
 
 
+logger = logging.getLogger(__name__)
+
 EXTERNAL = Path("data/external")
 PROCESSED = EXTERNAL / "processed"
 
 SPROUT_REPO = "CARROT-LLM-Routing/SPROUT"
-SPROUT_REVISION = "d54e3cd"
+SPROUT_REVISION = "d54e3cda2189ca1ed13a877a44ed34736c4b6920"
 SPROUT_FILES = ("data/validation-00000-of-00001.parquet",
                 "data/test-00000-of-00001.parquet")
 ROUTERBENCH_REPO = "withmartian/routerbench"
-ROUTERBENCH_REVISION = "7840214"
+ROUTERBENCH_REVISION = "784021482c3f320c6619ed4b3bb3b41a21424fcb"
 ROUTERBENCH_FILE = "routerbench_0shot.pkl"
+# SHA-256 of that file at ROUTERBENCH_REVISION (the Hub's LFS object id).
+ROUTERBENCH_SHA256 = "ba4f77f19517610a707c374e99322d7750c30fc4ae7ff5527888595a1e65d36d"
 
 # USD per million tokens, [input, output].  Copied verbatim from
 # carrot/constants.py (SPROUT_COSTS) at github.com/somerstep/CARROT@3e6acff, the
@@ -79,7 +88,7 @@ LLMROUTERBENCH_DOMAINS = ("knowledge", "math", "code", "software_engineering",
 # called through their APIs, with the tokens and dollar cost of every call.
 # The published archive is bench-release.tar.gz at HF NPULH/LLMRouterBench.
 LLMROUTERBENCH_REPO = "NPULH/LLMRouterBench"
-LLMROUTERBENCH_REVISION = "0e5af1b"
+LLMROUTERBENCH_REVISION = "0e5af1b84bf73437a01a1849c0f1d2468baa93fc"
 LLMROUTERBENCH_DATASETS = {
     # directory: domain
     "mmlupro/test_3000": "knowledge",
@@ -214,8 +223,82 @@ def build_sprout(root: Path = EXTERNAL) -> tuple[pd.DataFrame, pd.DataFrame]:
     return _finish(items, pd.concat(rows, ignore_index=True), SPROUT_DOMAINS)
 
 
+class _RestrictedUnpickler(pickle.Unpickler):
+    """Unpickler that resolves only an exact list of pandas/numpy globals.
+
+    The RouterBench table is a pickle downloaded from a third-party repository;
+    plain ``pd.read_pickle`` would execute whatever code such a file carries.
+    An earlier version allowed whole module prefixes, and a payload calling
+    ``DataFrame.to_csv`` could then write a file.  Only the listed names are
+    resolved now and dotted attribute paths are refused.  The primary control
+    is the SHA-256 check in ``read_trusted_dataframe``; this list is a second
+    layer, not a sandbox.
+    """
+
+    _NUMPY = ("numpy", "numpy.core.multiarray", "numpy._core.multiarray",
+              "numpy.core.numeric", "numpy._core.numeric")
+    _NAMES = frozenset(
+        {(m, n) for m in _NUMPY for n in ("dtype", "ndarray", "_reconstruct", "scalar", "_frombuffer")}
+        | {
+            ("pandas", "DataFrame"), ("pandas", "Series"), ("pandas", "Index"),
+            ("pandas", "MultiIndex"), ("pandas", "RangeIndex"), ("pandas", "StringDtype"),
+            ("pandas", "Timestamp"), ("pandas", "Timedelta"),
+            ("pandas.core.frame", "DataFrame"), ("pandas.core.series", "Series"),
+            ("pandas.core.indexes.base", "Index"), ("pandas.core.indexes.base", "_new_Index"),
+            ("pandas.core.indexes.range", "RangeIndex"), ("pandas.core.indexes.multi", "MultiIndex"),
+            ("pandas.core.indexes.numeric", "Int64Index"), ("pandas.core.indexes.numeric", "Float64Index"),
+            ("pandas.core.indexes.datetimes", "DatetimeIndex"),
+            ("pandas.core.indexes.datetimes", "_new_DatetimeIndex"),
+            ("pandas.core.internals.managers", "BlockManager"),
+            ("pandas.core.internals.managers", "SingleBlockManager"),
+            ("pandas._libs.internals", "_unpickle_block"), ("pandas._libs.internals", "BlockPlacement"),
+            ("pandas._libs.arrays", "__pyx_unpickle_NDArrayBacked"),
+            ("pandas.arrays", "DatetimeArray"), ("pandas.arrays", "ArrowStringArray"),
+            ("pandas._libs.tslibs.timestamps", "_unpickle_timestamp"),
+            ("pandas._libs.tslibs.timedeltas", "_timedelta_unpickle"),
+            ("pyarrow.lib", "_restore_array"), ("pyarrow.lib", "py_buffer"),
+            ("pyarrow.lib", "type_for_alias"),
+            ("builtins", "slice"), ("builtins", "range"), ("builtins", "set"),
+            ("builtins", "frozenset"), ("builtins", "complex"), ("builtins", "bytearray"),
+            ("collections", "OrderedDict"), ("_codecs", "encode"),
+            ("datetime", "datetime"), ("datetime", "date"), ("datetime", "timedelta"),
+        }
+    )
+
+    def find_class(self, module, name):
+        if "." not in name and (module, name) in self._NAMES:
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(f"blocked global {module}.{name} in pickle")
+
+
+def read_trusted_dataframe(path: Path, sha256: str | None = None) -> pd.DataFrame:
+    """Load a DataFrame pickle without executing arbitrary code.
+
+    With ``sha256`` the file must hash to exactly that value, so only the
+    published file is ever unpickled; the bytes that were hashed are the bytes
+    that are loaded.  Set ROUTERBENCH_UNSAFE_PICKLE=1 to skip every check and
+    use ``pd.read_pickle`` on a file you have verified yourself.
+    """
+    if os.environ.get("ROUTERBENCH_UNSAFE_PICKLE") == "1":
+        logger.warning("Loading %s with unrestricted pickle (ROUTERBENCH_UNSAFE_PICKLE=1)", path)
+        return pd.read_pickle(path)
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if sha256 is not None:
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != sha256.lower():
+            raise ValueError(
+                f"{path}: SHA-256 {digest} does not match the pinned {sha256}; refusing to unpickle. "
+                "Re-download the file from the pinned revision."
+            )
+    frame = _RestrictedUnpickler(io.BytesIO(data)).load()
+    if not isinstance(frame, pd.DataFrame):
+        raise ValueError(f"{path} does not contain a DataFrame")
+    return frame
+
+
 def build_routerbench(root: Path = EXTERNAL) -> tuple[pd.DataFrame, pd.DataFrame]:
-    raw = pd.read_pickle(root / "routerbench" / ROUTERBENCH_FILE)
+    raw = read_trusted_dataframe(root / "routerbench" / ROUTERBENCH_FILE, ROUTERBENCH_SHA256)
     raw = raw.drop_duplicates("sample_id")
     models = [c for c in raw.columns
               if "|" not in c and c not in {"sample_id", "prompt", "eval_name", "oracle_model_to_route_to"}]

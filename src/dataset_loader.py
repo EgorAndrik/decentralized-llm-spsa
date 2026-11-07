@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Dict, List
@@ -88,21 +89,46 @@ def _load_triviaqa() -> List[str]:
     return questions
 
 
+# Hugging Face revisions the corpora are downloaded at.  Without a pin a
+# dataset can change upstream and silently change the experiment; the commit
+# hashes below are the heads observed on 2026-11-05.  If the paper's numbers
+# were produced from earlier snapshots, replace them with those hashes.
+HF_REVISIONS = {
+    "EdinburghNLP/xsum": "7d4d486c2f8ef850b1a11aead99b894ff3dd7da9",
+    "Helsinki-NLP/opus-100": "805090dc28bf78897da9641cdf08b61287580df9",
+    "NousResearch/hermes-function-calling-v1": "dae3e1d28cfbcf4b915c04ea1e072030529b4bda",
+}
+
+# The revision is part of each cache file name, so changing a pin above makes
+# the old cache invisible instead of silently serving data from another snapshot.
+XSUM_CACHE = f"xsum_documents_{HF_REVISIONS['EdinburghNLP/xsum'][:8]}.json"
+OPUS100_CACHE = f"opus100_sentences_{HF_REVISIONS['Helsinki-NLP/opus-100'][:8]}.json"
+HERMES_CACHE = f"hermes_fc_queries_{HF_REVISIONS['NousResearch/hermes-function-calling-v1'][:8]}.json"
+
+
+def _require_download_allowed(name: str) -> None:
+    """Tests and offline runs set LLM_SPSA_OFFLINE=1: no silent network access."""
+    if os.environ.get("LLM_SPSA_OFFLINE") == "1":
+        raise RuntimeError(f"{name}: download disabled (LLM_SPSA_OFFLINE=1) and no cache present")
+
+
 # ---------------------------------------------------------------------------
 # HuggingFace loaders (download once, cache as JSON)
 # ---------------------------------------------------------------------------
 
 def _load_xsum() -> List[str]:
     """Download XSum BBC articles as summarization task prompts."""
-    cache = _HF_CACHE / "xsum_documents.json"
+    cache = _HF_CACHE / XSUM_CACHE
     if cache.exists():
         texts: List[str] = json.loads(cache.read_text(encoding="utf-8"))
         logger.info("XSum: loaded %d tasks from cache", len(texts))
         return texts
 
+    _require_download_allowed("XSum")
     from datasets import load_dataset  # type: ignore[import]
 
-    ds = load_dataset("EdinburghNLP/xsum", split="test", trust_remote_code=False)
+    ds = load_dataset("EdinburghNLP/xsum", split="test", trust_remote_code=False,
+                      revision=HF_REVISIONS["EdinburghNLP/xsum"])
     texts = [
         f"Summarize the following article:\n{row['document'][:500]}"
         for row in ds
@@ -115,17 +141,19 @@ def _load_xsum() -> List[str]:
 
 def _load_opus100() -> List[str]:
     """Download OPUS-100 English→French translation prompts (Helsinki-NLP)."""
-    cache = _HF_CACHE / "opus100_sentences.json"
+    cache = _HF_CACHE / OPUS100_CACHE
     if cache.exists():
         texts: List[str] = json.loads(cache.read_text(encoding="utf-8"))
         logger.info("OPUS-100: loaded %d tasks from cache", len(texts))
         return texts
 
+    _require_download_allowed("OPUS-100")
     from datasets import load_dataset  # type: ignore[import]
 
     ds = load_dataset(
         "Helsinki-NLP/opus-100", "en-fr",
         split="test", trust_remote_code=False,
+        revision=HF_REVISIONS["Helsinki-NLP/opus-100"],
     )
     texts = [
         f"Translate from English to French:\n{row['translation']['en']}"
@@ -143,17 +171,19 @@ def _load_hermes_fc() -> List[str]:
     Extracts the first human turn from each conversation, which contains a
     natural-language request that requires API / tool invocation.
     """
-    cache = _HF_CACHE / "hermes_fc_queries.json"
+    cache = _HF_CACHE / HERMES_CACHE
     if cache.exists():
         texts: List[str] = json.loads(cache.read_text(encoding="utf-8"))
         logger.info("Hermes FC: loaded %d tasks from cache", len(texts))
         return texts
 
+    _require_download_allowed("Hermes FC")
     from datasets import load_dataset  # type: ignore[import]
 
     ds = load_dataset(
         "NousResearch/hermes-function-calling-v1",
         split="train", trust_remote_code=False,
+        revision=HF_REVISIONS["NousResearch/hermes-function-calling-v1"],
     )
     texts: List[str] = []
     for row in ds:

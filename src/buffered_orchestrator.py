@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import logging
 import math
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence
@@ -28,7 +29,11 @@ from .main import (
     mse,
     rank_agents,
 )
+from .llm_api import BudgetExceeded
 from .spsa_variants import call_variant
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -296,6 +301,7 @@ class BufferedOrchestrator(ExactOrchestrator):
         )
         try:
             api_result = self.llm_api_client.call(profile.model_name, prompt, task.type.name)
+            self.api_stats["calls"] += 1
             service_time = float(api_result.get("latency") or assignment.predicted_processing)
             input_tokens = self._estimate_task_tokens(task)
             output = str(api_result.get("output", ""))
@@ -319,7 +325,13 @@ class BufferedOrchestrator(ExactOrchestrator):
                 * ((input_tokens + output_tokens) / 1000.0),
                 "execution_failed": not bool(api_result.get("success", True)),
             }
-        except Exception:
+        except BudgetExceeded:
+            raise  # лимит расходов должен остановить прогон, а не стать «сбоем исполнения»
+        except Exception as exc:
+            self.api_stats["calls"] += 1
+            self.api_stats["failed"] += 1
+            logger.warning("LLM call to %s failed (%s: %s); task marked execution_failed",
+                           profile.model_name, type(exc).__name__, exc)
             service_time = max(0.01, float(assignment.predicted_processing))
             input_tokens = self._estimate_task_tokens(task)
             actual_wait = max(0.0, self.time - task.t_arrival)

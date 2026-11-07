@@ -6,19 +6,14 @@ import pandas as pd
 
 try:
     from .main import ExactOrchestrator, SimulationVariant
-    from .llm_api import LLMAPIClient
+    from .llm_api import LLMAPIClient, import_config_module
 except ImportError:
     from main import ExactOrchestrator, SimulationVariant
-    from llm_api import LLMAPIClient
+    from llm_api import LLMAPIClient, import_config_module
 
 
 def load_api_config():
-    try:
-        import importlib
-        cfg = importlib.import_module(".llm_config", package=__package__)
-    except ImportError:
-        import importlib
-        cfg = importlib.import_module("llm_config")
+    cfg = import_config_module("llm_config", __package__)
     endpoints = getattr(cfg, "LLM_ENDPOINTS", {})
     api_keys = getattr(cfg, "LLM_API_KEYS", {})
     aliases = getattr(cfg, "LLM_MODEL_ALIASES", {})

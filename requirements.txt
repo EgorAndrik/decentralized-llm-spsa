@@ -1,8 +1,13 @@
-numpy>=2.0
-pandas>=2.0
-matplotlib>=3.8
-scipy>=1.13
-plotly>=5.0
-catboost>=1.2
-requests>=2.31
-datasets>=2.19
+numpy>=2.0,<3
+pandas>=2.0,<4
+matplotlib>=3.8,<4
+scipy>=1.13,<2
+plotly>=5.0,<7
+catboost>=1.2,<2
+requests>=2.31,<3
+datasets>=2.19,<6
+# imported by the code but previously undeclared
+scikit-learn>=1.4,<2
+sentence-transformers>=3.0,<6
+huggingface_hub>=0.23,<2
+pyarrow>=15

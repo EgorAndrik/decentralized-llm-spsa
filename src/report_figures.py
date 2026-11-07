@@ -170,14 +170,15 @@ def _run_jobs(jobs, workers: int) -> list[dict]:
 
 def policy_operational_data(workers: int) -> pd.DataFrame:
     """Test-stream simulations with the low-noise weights, at the tuning load."""
-    path = DATA / f"policy_operational{CACHE}.pkl"
+    # Parquet, not pickle: unpickling a cache file would execute code from it.
+    path = DATA / f"policy_operational{CACHE}.parquet"
     if path.exists():
-        return pd.read_pickle(path)
+        return pd.read_parquet(path)
     cfg = _policy_cfg()
     rows = _run_jobs(_policy_jobs("low_noise", [cfg["rho"]], cfg["test_seeds"]), workers)
     frame = pd.DataFrame(rows)
     DATA.mkdir(parents=True, exist_ok=True)
-    frame.to_pickle(path)
+    frame.to_parquet(path, index=False)
     return frame
 
 

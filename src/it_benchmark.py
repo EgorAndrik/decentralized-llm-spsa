@@ -25,7 +25,9 @@ from .it_dataset_loader import ITSkill, TaskKind, infer_task_kind
 
 STACKPULSE_ID = "Omarrran/StackPulse_778K_QnA_Code_dataset"
 STACKPULSE_CONFIG = "high_quality"
-STACKPULSE_REVISION = "18c9ddf"
+STACKPULSE_REVISION = "18c9ddf"  # short form, recorded in the committed manifest
+# Full commit used for the download; the short form above is only its label.
+STACKPULSE_COMMIT = "18c9ddf9a10d3a2c5cf433db7dcd36d7573fe44c"
 
 # Tags are deliberately conservative.  Ambiguous tags such as
 # ``authentication`` and generic ``python`` are not domain labels.
@@ -229,7 +231,7 @@ def load_routing_benchmark(per_skill: int = 200, seed: int = 42, cache_dir: str 
         from datasets import load_dataset
     except ImportError as exc:
         raise RuntimeError("Install dependencies from requirements.txt") from exc
-    kwargs: dict[str, Any] = {"split": "train", "revision": STACKPULSE_REVISION}
+    kwargs: dict[str, Any] = {"split": "train", "revision": STACKPULSE_COMMIT}
     if cache_dir is not None:
         kwargs["cache_dir"] = str(cache_dir)
     rows = load_dataset(STACKPULSE_ID, STACKPULSE_CONFIG, **kwargs)
