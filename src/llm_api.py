@@ -130,7 +130,10 @@ class LLMAPIClient:
         for model_name, url in endpoints.items():
             validate_endpoint(url, self.allowed_hosts)
         if max_calls is None and os.environ.get("LLM_MAX_CALLS"):
-            max_calls = int(os.environ["LLM_MAX_CALLS"])
+            try:
+                max_calls = int(os.environ["LLM_MAX_CALLS"])
+            except ValueError:
+                raise ValueError(f"LLM_MAX_CALLS must be an integer, got {os.environ['LLM_MAX_CALLS']!r}") from None
         self.max_calls = max_calls
         self.calls_made = 0
         self.endpoints = endpoints

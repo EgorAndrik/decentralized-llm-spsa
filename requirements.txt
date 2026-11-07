@@ -10,4 +10,4 @@ datasets>=2.19,<6
 scikit-learn>=1.4,<2
 sentence-transformers>=3.0,<6
 huggingface_hub>=0.23,<2
-pyarrow>=15
+pyarrow>=15,<27

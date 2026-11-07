@@ -299,8 +299,10 @@ class BufferedOrchestrator(ExactOrchestrator):
         prompt = task.text or (
             f"{task.type.name}: complexity={task.h_Ti:.2f}, urgency={task.urgency:.2f}"
         )
+        called = False
         try:
             api_result = self.llm_api_client.call(profile.model_name, prompt, task.type.name)
+            called = True
             self.api_stats["calls"] += 1
             service_time = float(api_result.get("latency") or assignment.predicted_processing)
             input_tokens = self._estimate_task_tokens(task)
@@ -328,7 +330,8 @@ class BufferedOrchestrator(ExactOrchestrator):
         except BudgetExceeded:
             raise  # лимит расходов должен остановить прогон, а не стать «сбоем исполнения»
         except Exception as exc:
-            self.api_stats["calls"] += 1
+            if not called:
+                self.api_stats["calls"] += 1
             self.api_stats["failed"] += 1
             logger.warning("LLM call to %s failed (%s: %s); task marked execution_failed",
                            profile.model_name, type(exc).__name__, exc)

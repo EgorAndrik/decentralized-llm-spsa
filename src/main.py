@@ -1796,8 +1796,10 @@ class ExactOrchestrator:
                 task_tokens = self._estimate_task_tokens(runtime_task)
                 task_cost = MODEL_TOKEN_PRICE.get(profile.model_name, 0.5) * (task_tokens / 1000.0)
                 prompt = task.text or f"{task.type.name}: complexity={task.h_Ti:.2f}, urgency={task.urgency:.2f}"
+                called = False
                 try:
                     api_result = self.llm_api_client.call(profile.model_name, prompt, task.type.name)
+                    called = True
                     self.api_stats["calls"] += 1
                     api_success = bool(api_result.get("success", True))
                     agent_wait = max(0.0, selected.available_at - decision_time)
@@ -1815,7 +1817,8 @@ class ExactOrchestrator:
                 except Exception as exc:
                     # Раньше сбой реального вызова молча заменялся смоделированным результатом,
                     # и в выходных данных их нельзя было отличить. Теперь это считается и логируется.
-                    self.api_stats["calls"] += 1
+                    if not called:
+                        self.api_stats["calls"] += 1
                     self.api_stats["simulated_after_failure"] += 1
                     logger.warning(
                         "LLM call to %s failed (%s: %s); the outcome is SIMULATED (%d so far)",

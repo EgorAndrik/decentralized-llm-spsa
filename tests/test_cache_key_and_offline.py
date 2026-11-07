@@ -62,11 +62,16 @@ class TestOfflineAndRevisionKeyedCache(unittest.TestCase):
                            (dataset_loader.HERMES_CACHE, "NousResearch/hermes-function-calling-v1")):
             self.assertIn(dataset_loader.HF_REVISIONS[repo][:8], name)
 
-    def test_cache_for_another_revision_is_not_used(self):
+    def test_pre_pin_cache_is_used_when_no_keyed_cache_exists(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(dataset_loader, "_HF_CACHE", Path(tmp)):
-            (Path(tmp) / "xsum_documents.json").write_text(json.dumps(["stale text"]))  # the old, unkeyed name
-            with self.assertRaises(RuntimeError):
-                dataset_loader._load_xsum()
+            (Path(tmp) / "xsum_documents.json").write_text(json.dumps(["earlier snapshot"]))
+            self.assertEqual(dataset_loader._load_xsum(), ["earlier snapshot"])
+
+    def test_keyed_cache_takes_precedence_over_pre_pin_cache(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(dataset_loader, "_HF_CACHE", Path(tmp)):
+            (Path(tmp) / "xsum_documents.json").write_text(json.dumps(["earlier snapshot"]))
+            (Path(tmp) / dataset_loader.XSUM_CACHE).write_text(json.dumps(["pinned snapshot"]))
+            self.assertEqual(dataset_loader._load_xsum(), ["pinned snapshot"])
 
 
 if __name__ == "__main__":

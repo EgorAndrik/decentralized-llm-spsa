@@ -105,6 +105,29 @@ XSUM_CACHE = f"xsum_documents_{HF_REVISIONS['EdinburghNLP/xsum'][:8]}.json"
 OPUS100_CACHE = f"opus100_sentences_{HF_REVISIONS['Helsinki-NLP/opus-100'][:8]}.json"
 HERMES_CACHE = f"hermes_fc_queries_{HF_REVISIONS['NousResearch/hermes-function-calling-v1'][:8]}.json"
 
+# Caches written before the pins existed.  They hold the snapshot the earlier
+# runs used, so they take precedence over downloading the pinned revision.
+LEGACY_CACHES = {
+    XSUM_CACHE: "xsum_documents.json",
+    OPUS100_CACHE: "opus100_sentences.json",
+    HERMES_CACHE: "hermes_fc_queries.json",
+}
+
+
+def _read_cache(name: str, cache_name: str):
+    """Texts from the revision-keyed cache, else from the pre-pin cache, else None."""
+    for file_name, legacy in ((cache_name, False), (LEGACY_CACHES[cache_name], True)):
+        cache = _HF_CACHE / file_name
+        if cache.exists():
+            texts: List[str] = json.loads(cache.read_text(encoding="utf-8"))
+            if legacy:
+                logger.info("%s: loaded %d tasks from pre-pin cache %s (revision unknown)",
+                            name, len(texts), file_name)
+            else:
+                logger.info("%s: loaded %d tasks from cache", name, len(texts))
+            return texts
+    return None
+
 
 def _require_download_allowed(name: str) -> None:
     """Tests and offline runs set LLM_SPSA_OFFLINE=1: no silent network access."""
@@ -118,11 +141,10 @@ def _require_download_allowed(name: str) -> None:
 
 def _load_xsum() -> List[str]:
     """Download XSum BBC articles as summarization task prompts."""
+    cached = _read_cache("XSum", XSUM_CACHE)
+    if cached is not None:
+        return cached
     cache = _HF_CACHE / XSUM_CACHE
-    if cache.exists():
-        texts: List[str] = json.loads(cache.read_text(encoding="utf-8"))
-        logger.info("XSum: loaded %d tasks from cache", len(texts))
-        return texts
 
     _require_download_allowed("XSum")
     from datasets import load_dataset  # type: ignore[import]
@@ -141,11 +163,10 @@ def _load_xsum() -> List[str]:
 
 def _load_opus100() -> List[str]:
     """Download OPUS-100 English→French translation prompts (Helsinki-NLP)."""
+    cached = _read_cache("OPUS-100", OPUS100_CACHE)
+    if cached is not None:
+        return cached
     cache = _HF_CACHE / OPUS100_CACHE
-    if cache.exists():
-        texts: List[str] = json.loads(cache.read_text(encoding="utf-8"))
-        logger.info("OPUS-100: loaded %d tasks from cache", len(texts))
-        return texts
 
     _require_download_allowed("OPUS-100")
     from datasets import load_dataset  # type: ignore[import]
@@ -171,11 +192,10 @@ def _load_hermes_fc() -> List[str]:
     Extracts the first human turn from each conversation, which contains a
     natural-language request that requires API / tool invocation.
     """
+    cached = _read_cache("Hermes FC", HERMES_CACHE)
+    if cached is not None:
+        return cached
     cache = _HF_CACHE / HERMES_CACHE
-    if cache.exists():
-        texts: List[str] = json.loads(cache.read_text(encoding="utf-8"))
-        logger.info("Hermes FC: loaded %d tasks from cache", len(texts))
-        return texts
 
     _require_download_allowed("Hermes FC")
     from datasets import load_dataset  # type: ignore[import]
