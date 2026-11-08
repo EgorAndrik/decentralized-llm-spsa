@@ -2,6 +2,7 @@
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from src import real_benchmarks
@@ -20,6 +21,29 @@ def test_split_is_a_pure_function_of_the_prompt_identity():
     splits = [real_benchmarks._split_of(f"x:{i}") for i in range(5000)]
     shares = {name: splits.count(name) / len(splits) for name in ("train", "validation", "test")}
     assert abs(shares["train"] - 0.6) < 0.03 and abs(shares["test"] - 0.2) < 0.03
+
+
+def test_replay_drops_whole_prompts_with_invalid_input_tokens_in_builds_and_caches(tmp_path):
+    items = pd.DataFrame({"item_id": ["ok", "nan", "inf"], "domain_name": ["knowledge"] * 3})
+    outcomes = pd.DataFrame([
+        {
+            "item_id": item_id, "model": model, "quality": 1.0, "cost_usd": 0.01,
+            "input_tokens": tokens if model == "a" else 10, "output_tokens": 20,
+        }
+        for item_id, tokens in [("ok", 10), ("nan", np.nan), ("inf", np.inf)]
+        for model in ("a", "b")
+    ])
+    built_items, built_outcomes = real_benchmarks._finish(items, outcomes, real_benchmarks.SPROUT_DOMAINS)
+    assert built_items["item_id"].tolist() == ["ok"]
+    assert built_outcomes["model"].tolist() == ["a", "b"]
+
+    cache = tmp_path / "processed"
+    cache.mkdir()
+    items.to_parquet(cache / "sprout_items.parquet", index=False)
+    outcomes.to_parquet(cache / "sprout_outcomes.parquet", index=False)
+    cached_items, cached_outcomes = real_benchmarks.load("sprout", tmp_path)
+    assert cached_items["item_id"].tolist() == ["ok"]
+    assert cached_outcomes["item_id"].tolist() == ["ok", "ok"]
 
 
 def test_domain_maps_cover_six_families_and_reject_unknown_sources():

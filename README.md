@@ -60,18 +60,30 @@ paths.** Only `src.run_paper_experiments` produces paper evidence.
 pip install -r requirements.txt
 ```
 
-### API keys (real-LLM mode only)
+### Connecting a provider (real-LLM mode only)
+
+Agents and the judge share a LangChain client for APIs that implement OpenAI
+Chat Completions. Configure the base URL (without `/chat/completions`), the
+provider's model IDs and API credentials. No provider-specific Python SDK is
+needed to add another compatible endpoint.
+
+The example config maps the first two agent profiles to Groq models. To try
+that configuration with a small API run:
 
 ```bash
 cp src/llm_config_example.py src/llm_config.py
-# edit src/llm_config.py — add your Groq / OpenRouter key
-```
-
-Or export the Groq key as an environment variable:
-
-```bash
 export GROQ_API_KEY="gsk_..."
+LLM_MAX_CALLS=10 python -m src.run_buffered_simulation --mode api --agents 2 --tasks 2
 ```
+
+For a different endpoint, update `LLM_ENDPOINTS` and `LLM_MODEL_ALIASES` in
+`src/llm_config.py`. Use `LLM_API_KEY_<INTERNAL_NAME>` for a per-model
+credential (for example, `LLM_API_KEY_LLAMA3_8B_INSTRUCT`), or populate
+`LLM_API_KEYS` from your provider's environment variable. Add a trusted
+HTTPS hostname via `LLM_ALLOWED_HOSTS` if it is not already allowed.
+For comparison runs, configure every agent profile the runner uses. The
+two-agent example reuses one worker model as the judge to demonstrate the
+connection.
 
 ## Reproducing Results
 
@@ -109,13 +121,105 @@ python -m src.audit_it_benchmark --per-skill 200 --seed 42 \
 ### Global-buffer architecture demo
 
 ```bash
-python -m src.run_buffered_simulation --tasks 200 --controllers 3 --agents 5 \
+python -m src.run_buffered_simulation --mode simulation --tasks 200 --controllers 3 --agents 5 \
        --seed 42 --output-dir buffered_outputs
 ```
 
-The runner writes task, event, feedback, and summary tables. In simulation,
-time advances to the next arrival or completion event. With real endpoints,
-the same state machine uses measured API latency.
+Simulation is the default and requires no credentials. Use `--mode api` with
+the provider config above to run the same scheduler with real model calls for
+both agents and the judge. API mode defaults to one generated task. To send
+your own task and print the chosen model's answer:
+
+```bash
+LLM_MAX_CALLS=10 python -m src.run_buffered_simulation --mode api --agents 2 \
+       --prompt "Explain optimistic locking in two sentences."
+```
+
+Both modes write task, event, feedback, and summary tables. In API mode,
+model answers go into `responses.jsonl`, keyed by task ID. Failed calls,
+empty results and answers rejected by the judge give a nonzero exit code.
+In API mode they also miss the deadline metric, and `--prompt` only prints
+an accepted answer. The summary records `run_status` (`running`, `completed`,
+`partial`, `failed` or `interrupted`). Reports are cleared at the start of a
+new run. On Ctrl+C the runner saves collected results and exits with code 130.
+
+API latency measures elapsed time from task submission to evaluation,
+including the judge. The scheduler still uses a virtual clock and sends
+API requests sequentially. Virtual times are labelled `scheduler_*` in
+the API tables.
+
+API cost estimates include the agent and judge. They use the token counts
+returned by the provider and `LLM_TOKEN_PRICES` (USD per million input
+and output tokens, keyed by provider model ID). When any call lacks
+usage or a price, the total is left blank and the summary reports the
+known subtotal and number of unpriced calls.
+Before dispatch, the router uses the configured input rates for its cost
+estimate. It omits the price comparison when a candidate's rate is unknown.
+
+#### Optional Tavily web search
+
+Set `TAVILY_API_KEY` in the environment to add a separate search worker in
+API mode. Tasks tagged with `--web-search` use that worker. The controller
+and global buffer still handle assignment, and the configured judge scores
+the answer and source excerpts. The search worker is separate from the
+LLM agents counted by `--agents`.
+
+With the API configuration above in place:
+
+```bash
+export TAVILY_API_KEY="tvly-..."
+LLM_MAX_CALLS=2 python -m src.run_buffered_simulation --mode api --agents 2 \
+       --web-search --prompt "Find the official Python documentation for asyncio.TaskGroup."
+```
+
+Ordinary prompts and simulation send no requests to Tavily. A search
+request without a key exits with a configuration error. Search calls share
+the run's API budget with models and the judge. The report records Tavily
+credits separately from LLM tokens and estimated USD costs. If you use a
+knowledge database, search feedback is recorded as `WEB_SEARCH` and can
+use the same database as your existing LLM pool.
+
+See the [Tavily Search API documentation](https://docs.tavily.com/documentation/api-reference/endpoint/search)
+for the request and credit usage fields.
+
+#### Routing experience and MVP warm-up
+
+Pass `--knowledge-db` to keep routing experience in SQLite across runs.
+Each controller records the count, outcome, judge score and execution time
+by task type and agent. Every `--round-size` evaluated tasks publish a shared
+snapshot across controllers. The router uses local estimates when available
+and the shared snapshot for pairs it has not seen. API failures without a
+judge score do not advance the round. Failure counts are saved separately
+and reduce the affected agent's estimate. The database stores a fingerprint
+for coverage checks. It stores no prompt text or answers.
+
+For example, collect three rounds of five tasks using `prompts.txt` with
+one distinct representative prompt per line:
+
+```bash
+LLM_MAX_CALLS=30 python -m src.run_buffered_simulation --mode api --agents 2 \
+       --knowledge-db buffered_outputs/routing_knowledge.sqlite3 \
+       --round-size 5 --mvp-rounds 3 --warmup-file prompts.txt --tasks 15
+```
+
+After the summary shows `mvp_ready=True`, use the same database to route a
+user prompt:
+
+```bash
+python -m src.run_buffered_simulation --mode api --agents 2 \
+       --knowledge-db buffered_outputs/routing_knowledge.sqlite3 \
+       --prompt "Explain optimistic locking in two sentences."
+```
+
+MVP readiness is published at a round boundary and also requires at least
+two distinct evaluated prompts and an evaluation for every configured LLM
+agent and controller. Search feedback
+does not cover an LLM slot. The database keeps incomplete rounds, so another
+batch can finish the warm-up. Existing databases keep their observations and
+need new evaluations to establish prompt diversity. Use a separate database
+for simulation or a different model pool.
+Knowledge rounds publish routing statistics and are separate from the
+existing A-SPSA parameter synchronization rounds.
 
 ### Legacy comparison scripts
 

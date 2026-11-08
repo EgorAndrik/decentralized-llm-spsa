@@ -1,11 +1,16 @@
 import importlib
 import logging
+import math
 import os
 import re
 import time
-import requests
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
+
+from httpx import Client as HTTPClient, Response
+from langchain_openai import ChatOpenAI
+from langsmith import tracing_context
+from openai import APIConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +52,7 @@ def validate_endpoint(base_url: str, allowed_hosts) -> None:
 
 
 def api_key_from_env(model_name: str, configured: Optional[str], base_url: Optional[str] = None) -> Optional[str]:
-    """Key for a model, in order: LLM_API_KEY_<MODEL>, LLM_API_KEY (OpenRouter models only), the config value.
+    """Prefer the model-specific key, then the provider key, then the config value.
 
     The model name is upper-cased with non-alphanumerics replaced by '_',
     e.g. "qwen2.5-72b-instruct" -> LLM_API_KEY_QWEN2_5_72B_INSTRUCT.
@@ -59,6 +64,8 @@ def api_key_from_env(model_name: str, configured: Optional[str], base_url: Optio
     if specific:
         return specific
     host = (urlparse(base_url).hostname or "").lower() if base_url else ""
+    if host == "api.groq.com" and os.environ.get("GROQ_API_KEY"):
+        return os.environ["GROQ_API_KEY"]
     if host == "openrouter.ai" and os.environ.get("LLM_API_KEY"):
         return os.environ["LLM_API_KEY"]
     return configured
@@ -80,24 +87,31 @@ def import_config_module(config_name: str, package: Optional[str]):
     return importlib.import_module(config_name)
 
 
-class LLMAPIClient:
-    """
-    OpenAI-compatible chat completions client.
+def _validate_chat_response(response: Response) -> None:
+    """Check the wire response before LangChain normalizes missing content."""
+    if response.has_redirect_location:
+        raise LLMResponseError("Unexpected redirect from the LLM endpoint")
+    if not response.is_success:
+        return
+    try:
+        response.read()
+        content = response.json()["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise LLMResponseError("Provider response is not a chat completion") from None
+    if not isinstance(content, str):
+        raise LLMResponseError("Provider completion content is not text")
 
-    Works with any provider that implements /v1/chat/completions:
-      - OpenRouter  (one key for all models)
-      - Groq        (Llama, Mistral — free tier available)
-      - Together AI (Qwen, Llama, DeepSeek)
-      - DeepSeek    (deepseek-coder, deepseek-chat)
-      - Mistral AI  (mistral-7b, mixtral)
+
+class LLMAPIClient:
+    """LangChain client for endpoints implementing OpenAI Chat Completions.
 
     Parameters
     ----------
     endpoints : {model_name: base_url}
-        Base URL up to /v1, e.g. "https://openrouter.ai/api/v1".
-        For OpenRouter you can point every model at the same URL.
+        Base URL before /chat/completions, e.g. "https://api.groq.com/openai/v1".
+        Models served by the same provider can share a URL and key.
     api_keys : {model_name: key}
-        API keys per model. For OpenRouter all keys are identical.
+        Optional configured API keys per model, used after environment keys.
     model_aliases : {model_name: remote_model_id}, optional
         Maps internal model names to provider model IDs, e.g.
         {"llama3-8b-instruct": "meta-llama/llama-3-8b-instruct"}.
@@ -111,6 +125,8 @@ class LLMAPIClient:
     max_calls : int, optional
         Hard cap on the number of requests sent; the next call raises
         BudgetExceeded.  Defaults to LLM_MAX_CALLS if set, else no cap.
+    token_prices : {remote_model_id: (input_rate, output_rate)}, optional
+        USD per million tokens. Missing prices or usage leave cost unknown.
     """
 
     def __init__(
@@ -123,6 +139,7 @@ class LLMAPIClient:
         timeout: int = 60,
         allowed_hosts=None,
         max_calls: Optional[int] = None,
+        token_prices: Optional[Dict[str, Tuple[float, float]]] = None,
     ):
         hosts = set(DEFAULT_ALLOWED_HOSTS) | {h.strip().lower() for h in (allowed_hosts or ()) if h.strip()}
         hosts |= {h.strip().lower() for h in os.environ.get("LLM_ALLOWED_HOSTS", "").split(",") if h.strip()}
@@ -139,16 +156,35 @@ class LLMAPIClient:
         self.endpoints = endpoints
         self.api_keys = api_keys
         self.model_aliases = model_aliases or {}
+        # Prices are USD per million input and output tokens, keyed by provider model ID.
+        self.token_prices = {}
+        for model_id, rates in (token_prices or {}).items():
+            try:
+                input_rate, output_rate = map(float, rates)
+                if any(not math.isfinite(rate) or rate < 0 for rate in (input_rate, output_rate)):
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid token prices for {model_id!r}: expected two non-negative rates") from None
+            self.token_prices[model_id] = (input_rate, output_rate)
         self.max_tokens = max_tokens
         self.max_tokens_per_model = max_tokens_per_model or {}
         self.timeout = timeout
 
+    def reserve_call(self) -> None:
+        """Count an outgoing request against the budget shared by workers and judge."""
+        if self.max_calls is not None and self.calls_made >= self.max_calls:
+            raise BudgetExceeded(
+                f"API call budget of {self.max_calls} requests is exhausted "
+                "(raise it with max_calls or LLM_MAX_CALLS)."
+            )
+        self.calls_made += 1
+
     def call(self, model_name: str, prompt: str, task_type: str) -> Dict[str, Any]:
         """
         Send a chat completion request. Returns:
-            {"output": str, "success": bool, "latency": float}
+        Text, latency, model ID and optional usage and estimated USD cost.
         Raises ValueError if the model is not configured.
-        Raises requests.HTTPError on non-2xx responses.
+        Provider HTTP failures propagate as SDK errors.
         """
         base_url = self.endpoints.get(model_name)
         api_key = api_key_from_env(model_name, self.api_keys.get(model_name), base_url)
@@ -160,45 +196,53 @@ class LLMAPIClient:
 
         validate_endpoint(base_url, self.allowed_hosts)
         remote_model = self.model_aliases.get(model_name, model_name)
-        url = base_url.rstrip("/") + "/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": remote_model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant. Respond in plain text only. Do not call any functions or tools."},
-                {"role": "user", "content": prompt},
-            ],
-            "max_tokens": self.max_tokens_per_model.get(model_name, self.max_tokens),
-        }
-
-        if self.max_calls is not None and self.calls_made >= self.max_calls:
-            raise BudgetExceeded(
-                f"API call budget of {self.max_calls} requests is exhausted "
-                "(raise it with max_calls or LLM_MAX_CALLS)."
+        with HTTPClient(
+            follow_redirects=False,
+            event_hooks={"response": [_validate_chat_response]},
+        ) as http_client:
+            model = ChatOpenAI(
+                model=remote_model,
+                base_url=base_url.rstrip("/"),
+                api_key=api_key,
+                timeout=self.timeout,
+                http_client=http_client,
+                use_responses_api=False,
+                max_retries=0,
+                cache=False,
+                # Preserve the Chat Completions token field used by existing endpoints.
+                extra_body={"max_tokens": self.max_tokens_per_model.get(model_name, self.max_tokens)},
             )
-        self.calls_made += 1
+            messages = [
+                ("system", "You are a helpful assistant. Respond in plain text only. Do not call any functions or tools."),
+                ("human", prompt),
+            ]
+            self.reserve_call()
+            t0 = time.perf_counter()
+            try:
+                with tracing_context(enabled=False):
+                    response = model.invoke(messages)
+            except APIConnectionError as exc:
+                if isinstance(exc.__cause__, LLMResponseError):
+                    raise exc.__cause__ from None
+                raise
+            latency = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        # Redirects are not followed: the Authorization header must not leave the validated host.
-        response = requests.post(
-            url, json=payload, headers=headers, timeout=self.timeout, allow_redirects=False,
-        )
-        latency = time.perf_counter() - t0
-
-        response.raise_for_status()
-        if response.is_redirect:
-            raise LLMResponseError(f"{model_name}: unexpected redirect to another location")
-        try:
-            content = response.json()["choices"][0]["message"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise LLMResponseError(f"{model_name}: response is not a chat completion ({type(exc).__name__})") from None
+        content = response.content
         if not isinstance(content, str):
-            raise LLMResponseError(f"{model_name}: completion content is {type(content).__name__}, not text")
+            raise LLMResponseError(f"{model_name}: completion content is not text")
+        usage = response.response_metadata.get("token_usage") or {}
+        input_tokens = usage.get("prompt_tokens")
+        output_tokens = usage.get("completion_tokens")
+        rates = self.token_prices.get(remote_model)
+        cost = None
+        if rates is not None and input_tokens is not None and output_tokens is not None:
+            cost = (input_tokens * rates[0] + output_tokens * rates[1]) / 1_000_000
         return {
             "output": content,
             "success": True,
             "latency": latency,
+            "model_name": response.response_metadata.get("model_name") or remote_model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": cost,
         }

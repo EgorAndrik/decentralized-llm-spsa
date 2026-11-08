@@ -107,6 +107,8 @@ class OutcomeTable:
 
     def __init__(self, benchmark: str, cfg: TableConfig, seed: int):
         items, outcomes = real_benchmarks.load(benchmark)
+        if items.empty or outcomes.empty:
+            raise ValueError(f"{benchmark} has no complete prompt/model outcomes to replay")
         self.benchmark = benchmark
         self.cfg = cfg
         self.domains = real_benchmarks.DOMAINS[benchmark]

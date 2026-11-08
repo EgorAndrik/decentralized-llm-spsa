@@ -78,6 +78,15 @@ def _decay_pert(step: int, b: float, t: float = 0.101) -> float:
 # Вспомогательные функции (зеркало main.py, без импорта из него)
 # =============================================================================
 
+def task_feature_vector(task_type, features, dimension, num_types=5):
+    """One coordinate per category plus an optional independent semantic feature."""
+    vector = np.zeros(dimension)
+    vector[task_type] = 1.0
+    if dimension > num_types:
+        vector[num_types] = float(np.mean(features))
+    return vector
+
+
 def _proc_loss(theta: np.ndarray, obs) -> float:
     """Raw MSE for time prediction."""
     if not obs:
@@ -85,9 +94,7 @@ def _proc_loss(theta: np.ndarray, obs) -> float:
     n = len(theta)
     errs = []
     for o in list(obs)[-25:]:
-        x = np.zeros(n)
-        x[o.task_type] = 1.0
-        x[n - 1] = float(np.mean(o.features))
+        x = task_feature_vector(o.task_type, o.features, n, getattr(o, "num_types", 5))
         errs.append((float(np.dot(theta, x)) - o.true_time) ** 2)
     return float(np.mean(errs)) if errs else 0.0
 
@@ -100,9 +107,7 @@ def _wait_loss(theta: np.ndarray, obs, delta: float = 0.1) -> float:
     n = len(theta)
     errs = []
     for o in list(obs)[-25:]:
-        x = np.zeros(n)
-        x[o.task_type] = 1.0
-        x[n - 1] = float(np.mean(o.features))
+        x = task_feature_vector(o.task_type, o.features, n, getattr(o, "num_types", 5))
         slack = float(np.dot(theta, x)) - o.true_wait - delta
         errs.append(max(0.0, -slack) ** 2)
     return float(np.mean(errs)) if errs else 0.0
@@ -170,12 +175,15 @@ def _clip_w(v: np.ndarray) -> np.ndarray:
 _C_BUDGET = 3.0
 
 
-def _h(theta_time: np.ndarray) -> float:
-    return float(np.mean(theta_time)) - _C_BUDGET
+def _h(theta_time: np.ndarray, num_types: int = 5) -> float:
+    return float(np.mean(theta_time[:num_types])) - _C_BUDGET
 
 
-def _grad_h(theta_time: np.ndarray) -> np.ndarray:
-    return np.ones_like(theta_time) / len(theta_time)
+def _grad_h(theta_time: np.ndarray, num_types: int = 5) -> np.ndarray:
+    grad = np.zeros_like(theta_time)
+    count = min(len(theta_time), num_types)
+    grad[:count] = 1.0 / count
+    return grad
 
 
 # =============================================================================
@@ -696,11 +704,12 @@ def pd_bandit_twopoint(
         c_w = _consensus(B, j, controllers, "theta_wait")
 
         # Primal: gradient + constraint + consensus
-        nt = ctrl.theta_time - alpha_t * (g_t + lam * _grad_h(ctrl.theta_time) + gamma * c_t)
+        num_types = getattr(ctrl, "num_types", 5)
+        nt = ctrl.theta_time - alpha_t * (g_t + lam * _grad_h(ctrl.theta_time, num_types) + gamma * c_t)
         nw = ctrl.theta_wait - alpha_t * (g_w + gamma * c_w)
 
         # Dual update
-        S[cid]["lam"] = max(0.0, lam + eta * _h(ctrl.theta_time))
+        S[cid]["lam"] = max(0.0, lam + eta * _h(ctrl.theta_time, num_types))
 
         new_t.append(nt)
         new_w.append(nw)
@@ -759,10 +768,11 @@ def pd_bandit_onepoint(
         c_t = _consensus(B, j, controllers, "theta_time")
         c_w = _consensus(B, j, controllers, "theta_wait")
 
-        nt = ctrl.theta_time - alpha_t * (g_t + lam * _grad_h(ctrl.theta_time) + gamma * c_t)
+        num_types = getattr(ctrl, "num_types", 5)
+        nt = ctrl.theta_time - alpha_t * (g_t + lam * _grad_h(ctrl.theta_time, num_types) + gamma * c_t)
         nw = ctrl.theta_wait - alpha_t * (g_w + gamma * c_w)
 
-        S[cid]["lam"] = max(0.0, lam + eta * _h(ctrl.theta_time))
+        S[cid]["lam"] = max(0.0, lam + eta * _h(ctrl.theta_time, num_types))
 
         new_t.append(nt)
         new_w.append(nw)

@@ -13,6 +13,14 @@ from src.main import (
 )
 
 class TestOrchestrator(unittest.TestCase):
+    def test_tool_use_has_its_own_time_feature(self):
+        controller = AdaptiveController(0)
+        features = np.zeros(5)
+        before = controller.predict_time(TaskType.TOOL_USE.value, features)
+        other = controller.predict_time(TaskType.QA.value, features)
+        controller.rls_update(TaskType.TOOL_USE.value, 5.0, 3.0, features)
+        self.assertGreater(controller.predict_time(TaskType.TOOL_USE.value, features), before)
+        self.assertEqual(controller.predict_time(TaskType.QA.value, features), other)
     def test_generate_stream(self):
         orch = ExactOrchestrator(num_ctrl=2, num_agents=3)
         tasks = orch.generate_realistic_stream(10)
