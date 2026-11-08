@@ -762,14 +762,14 @@ class BufferedOrchestrator(ExactOrchestrator):
         )
         return self.collect_summary()
 
-    def collect_summary(self):
+    def collect_summary(self, *, include_knowledge: bool = True):
         summary = super().collect_summary()
         if self.search_agent is not None:
             summary.update(
                 tavily_calls=self.search_agent.calls_made,
                 tavily_known_credits=self.search_agent.known_credits,
             )
-        if self.knowledge is not None:
+        if include_knowledge and self.knowledge is not None:
             observations = self.knowledge.observations
             rounds = observations // self.knowledge.round_size
             agents, controllers, prompts = self.knowledge.coverage()

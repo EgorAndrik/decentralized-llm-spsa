@@ -184,7 +184,10 @@ for the request and credit usage fields.
 
 #### Routing experience and MVP warm-up
 
-Pass `--knowledge-db` to keep routing experience in SQLite across runs.
+Set `ROUTING_DATABASE_URL` to the connection string for a PostgreSQL database
+and pass `--knowledge-db` to keep routing experience across runs. The database
+must already exist and the role must be able to create the `routing_*` tables
+in its schema. Runs without `--knowledge-db` do not connect to PostgreSQL.
 Each controller records the count, outcome, judge score and execution time
 by task type and agent. Every `--round-size` evaluated tasks publish a shared
 snapshot across controllers. The router uses local estimates when available
@@ -197,8 +200,9 @@ For example, collect three rounds of five tasks using `prompts.txt` with
 one distinct representative prompt per line:
 
 ```bash
+export ROUTING_DATABASE_URL='postgresql://user:password@localhost/routing'
 LLM_MAX_CALLS=30 python -m src.run_buffered_simulation --mode api --agents 2 \
-       --knowledge-db buffered_outputs/routing_knowledge.sqlite3 \
+       --knowledge-db \
        --round-size 5 --mvp-rounds 3 --warmup-file prompts.txt --tasks 15
 ```
 
@@ -207,7 +211,7 @@ user prompt:
 
 ```bash
 python -m src.run_buffered_simulation --mode api --agents 2 \
-       --knowledge-db buffered_outputs/routing_knowledge.sqlite3 \
+       --knowledge-db \
        --prompt "Explain optimistic locking in two sentences."
 ```
 
@@ -215,9 +219,18 @@ MVP readiness is published at a round boundary and also requires at least
 two distinct evaluated prompts and an evaluation for every configured LLM
 agent and controller. Search feedback
 does not cover an LLM slot. The database keeps incomplete rounds, so another
-batch can finish the warm-up. Existing databases keep their observations and
-need new evaluations to establish prompt diversity. Use a separate database
+batch can finish the warm-up. Use a separate database or PostgreSQL schema
 for simulation or a different model pool.
+
+To move existing routing experience from the old SQLite file, point
+`ROUTING_DATABASE_URL` at an empty PostgreSQL destination and run:
+
+```bash
+python -m src.migrate_routing_knowledge buffered_outputs/routing_knowledge.sqlite3
+```
+
+The import preserves the pool configuration, published snapshot, failures
+and warm-up progress present in the file.
 Knowledge rounds publish routing statistics and are separate from the
 existing A-SPSA parameter synchronization rounds.
 
@@ -238,6 +251,10 @@ python -m src.run_real_llm_comparison --tasks 100 --seeds 42,43 \
 ```bash
 python -m pytest -q
 ```
+
+Set `TEST_ROUTING_DATABASE_URL` to a PostgreSQL test database to also run
+storage and CLI integration tests. The test role must be able to create and
+drop temporary schemas. CI provisions its own PostgreSQL instance.
 
 `tests/test_protocol_fairness.py` pins the properties that make the optimizer
 comparison a comparison of optimizers: one consensus operator, one perturbation
