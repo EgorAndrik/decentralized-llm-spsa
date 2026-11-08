@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -48,6 +49,17 @@ class TestBufferedOrchestrator(unittest.TestCase):
         buffered = orch.buffer.tasks[1]
         self.assertEqual(buffered.controller_id, controller_id)
         self.assertEqual(set(buffered.proposals), {0, 1, 2, 3})
+
+    def test_api_proposals_use_configured_tariffs_instead_of_legacy_profiles(self):
+        client = SimpleNamespace(
+            model_aliases={"llama3-8b-instruct": "actual-a", "deepseek-coder-v2": "actual-b"},
+            token_prices={"actual-a": (4.0, 9.0), "actual-b": (1.0, 7.0)},
+        )
+        orch = BufferedOrchestrator(num_ctrl=1, num_agents=2, llm_api_client=client)
+        orch.submit_task(make_task(1))
+        proposals = orch.buffer.tasks[1].proposals
+        self.assertAlmostEqual(proposals[0].proposal.cost, 16 * 4.0 / 1_000_000)
+        self.assertAlmostEqual(proposals[1].proposal.cost, 16 / 1_000_000)
 
     def test_agent_executes_tasks_sequentially(self):
         orch = BufferedOrchestrator(num_ctrl=2, num_agents=1, variant=variant())

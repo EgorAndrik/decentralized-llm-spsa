@@ -33,6 +33,19 @@ class RoutingKnowledge:
                         PRIMARY KEY (controller_id, task_type, agent_id)
                     )
                 """)
+                self.db.execute("""
+                    CREATE TABLE IF NOT EXISTS execution_failures (
+                        controller_id INTEGER NOT NULL,
+                        task_type TEXT NOT NULL,
+                        agent_id INTEGER NOT NULL,
+                        failures INTEGER NOT NULL,
+                        PRIMARY KEY (controller_id, task_type, agent_id)
+                    )
+                """)
+                self.db.execute("CREATE TABLE IF NOT EXISTS evaluated_prompts (digest TEXT PRIMARY KEY)")
+                self.db.execute("""
+                    CREATE TABLE IF NOT EXISTS published_readiness (id INTEGER PRIMARY KEY, ready INTEGER NOT NULL)
+                """)
                 defaults = {
                     "version": 1, "scope": scope,
                     "round_size": round_size if round_size is not None else 5,
@@ -47,6 +60,8 @@ class RoutingKnowledge:
                         raise ValueError(f"Knowledge database already uses {field}={config[field]}.")
                 self.round_size = config["round_size"]
                 self.mvp_rounds = config["mvp_rounds"]
+                self.required_agents = set(range(len(scope["agents"])))
+                self.required_controllers = set(range(scope["controllers"]))
         except BaseException:
             self.close()
             raise
@@ -66,9 +81,33 @@ class RoutingKnowledge:
 
     @property
     def ready(self) -> bool:
-        return self.completed_rounds >= self.mvp_rounds
+        row = self.db.execute("SELECT ready FROM published_readiness WHERE id = 1").fetchone()
+        return bool(row and row[0])
 
-    def record(self, controller_id, task_type, agent_id, *, success, quality, service_seconds) -> int | None:
+    def coverage(self) -> tuple[set[int], set[int], int]:
+        pairs = self.db.execute("""
+            SELECT DISTINCT agent_id, controller_id FROM experience
+            WHERE controller_id >= 0 AND task_type != 'WEB_SEARCH'
+        """).fetchall()
+        prompts = self.db.execute("SELECT COUNT(*) FROM evaluated_prompts").fetchone()[0]
+        return {pair[0] for pair in pairs}, {pair[1] for pair in pairs}, prompts
+
+    @property
+    def failures(self) -> int:
+        return self.db.execute(
+            "SELECT COALESCE(SUM(failures), 0) FROM execution_failures WHERE controller_id >= 0"
+        ).fetchone()[0]
+
+    def record_failure(self, controller_id, task_type, agent_id) -> None:
+        with self.db:
+            self.db.execute("""
+                INSERT INTO execution_failures VALUES (?, ?, ?, 1)
+                ON CONFLICT (controller_id, task_type, agent_id) DO UPDATE SET failures = failures + 1
+            """, (controller_id, task_type, agent_id))
+
+    def record(
+        self, controller_id, task_type, agent_id, *, success, quality, service_seconds, prompt_digest=None,
+    ) -> int | None:
         """Save one evaluated outcome. Return the round number when a snapshot is published."""
         with self.db:
             self.db.execute("""
@@ -79,6 +118,8 @@ class RoutingKnowledge:
                     quality_sum = quality_sum + excluded.quality_sum,
                     service_seconds = service_seconds + excluded.service_seconds
             """, (controller_id, task_type, agent_id, int(success), quality, service_seconds))
+            if prompt_digest and task_type != "WEB_SEARCH":
+                self.db.execute("INSERT OR IGNORE INTO evaluated_prompts VALUES (?)", (prompt_digest,))
             count = self.observations
             if count % self.round_size:
                 return None
@@ -91,17 +132,46 @@ class RoutingKnowledge:
                        SUM(quality_sum), SUM(service_seconds)
                 FROM experience WHERE controller_id >= 0 GROUP BY task_type, agent_id
             """)
-            return count // self.round_size
+            self.db.execute("DELETE FROM execution_failures WHERE controller_id = -1")
+            self.db.execute("""
+                INSERT INTO execution_failures
+                SELECT -1, task_type, agent_id, SUM(failures)
+                FROM execution_failures WHERE controller_id >= 0 GROUP BY task_type, agent_id
+            """)
+            round_number = count // self.round_size
+            agents, controllers, prompts = self.coverage()
+            ready = (
+                round_number >= self.mvp_rounds
+                and self.required_agents <= agents
+                and self.required_controllers <= controllers
+                and prompts >= 2
+            )
+            self.db.execute("INSERT OR REPLACE INTO published_readiness VALUES (1, ?)", (int(ready),))
+            return round_number
 
     def estimate(self, controller_id, task_type, agent_id, quality_prior, time_prior):
         """Use the controller's experience, or the published snapshot for unseen pairs."""
         row = self.db.execute("""
-            SELECT observations, quality_sum, service_seconds
+            SELECT controller_id, observations, successes, quality_sum, service_seconds
             FROM experience WHERE controller_id IN (?, -1) AND task_type = ? AND agent_id = ?
             ORDER BY controller_id DESC LIMIT 1
         """, (controller_id, task_type, agent_id)).fetchone()
-        if row is None:
-            return quality_prior, time_prior
-        count, quality_sum, service_seconds = row
+        count, successes, quality_sum, service_seconds = row[1:] if row else (0, 0, 0.0, 0.0)
+        local_failure = self.db.execute("""
+            SELECT failures FROM execution_failures WHERE controller_id = ? AND task_type = ? AND agent_id = ?
+        """, (controller_id, task_type, agent_id)).fetchone()
+        if local_failure is not None:
+            failures = local_failure[0]
+            reliability_count = count if row and row[0] == controller_id else 0
+        elif row and row[0] == controller_id:
+            failures, reliability_count = 0, count
+        else:
+            shared_failure = self.db.execute("""
+                SELECT failures FROM execution_failures WHERE controller_id = -1 AND task_type = ? AND agent_id = ?
+            """, (task_type, agent_id)).fetchone()
+            failures, reliability_count = (shared_failure[0] if shared_failure else 0), count
         # Three observations' worth of prior dampens the effect of early samples.
-        return (quality_sum + 3 * quality_prior) / (count + 3), (service_seconds + 3 * time_prior) / (count + 3)
+        reliability = (reliability_count + 3) / (reliability_count + 3 + failures)
+        acceptance = (successes + 3) / (count + 3)
+        quality = (quality_sum + 3 * quality_prior) / (count + 3)
+        return quality * acceptance * reliability, (service_seconds + 3 * time_prior) / (count + 3)

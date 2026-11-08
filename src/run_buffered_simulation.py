@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -30,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--knowledge-db", type=Path, help="Persist routing experience in this SQLite file.")
     parser.add_argument("--round-size", type=int, help="Evaluated tasks per knowledge round (default: 5).")
     parser.add_argument("--mvp-rounds", type=int, help="Completed rounds before serving prompts (default: 3).")
+    parser.add_argument("--warmup-file", type=Path, help="UTF-8 file with one warm-up prompt per non-empty line.")
     parser.add_argument("--tasks", type=int, help="Generated task count (simulation: 200, API: 1 by default).")
     parser.add_argument("--controllers", type=int, default=3)
     parser.add_argument("--agents", type=int, default=5)
@@ -60,6 +62,9 @@ def load_api_client(config_name: str, agent_count: int) -> tuple[LLMAPIClient, s
 
 
 def write_reports(output_dir: Path, orchestrator: BufferedOrchestrator | None, summary: dict, mode: str) -> None:
+    summary_frame = pd.DataFrame([summary])
+    if summary["run_status"] == "running":
+        summary_frame.to_csv(output_dir / "summary.csv", index=False)
     tasks = pd.DataFrame(orchestrator.task_records if orchestrator is not None else [])
     events = pd.DataFrame(orchestrator.event_records if orchestrator is not None else [])
     feedback = pd.DataFrame(orchestrator.feedback_records if orchestrator is not None else [])
@@ -83,7 +88,8 @@ def write_reports(output_dir: Path, orchestrator: BufferedOrchestrator | None, s
     tasks.to_csv(output_dir / "task_records.csv", index=False)
     events.to_csv(output_dir / "event_records.csv", index=False)
     feedback.to_csv(output_dir / "feedback_records.csv", index=False)
-    pd.DataFrame([summary]).to_csv(output_dir / "summary.csv", index=False)
+    if summary["run_status"] != "running":
+        summary_frame.to_csv(output_dir / "summary.csv", index=False)
 
 
 def main() -> None:
@@ -99,6 +105,8 @@ def main() -> None:
         parser.error("--web-search requires --mode api and --prompt")
     if args.tasks is not None and args.tasks < 1:
         parser.error("--tasks must be positive")
+    if args.batch_size < 1 or not math.isfinite(args.tick_duration) or args.tick_duration <= 0:
+        parser.error("--batch-size and --tick-duration must be positive and finite")
     if args.knowledge_db is None and (args.round_size is not None or args.mvp_rounds is not None):
         parser.error("--round-size and --mvp-rounds require --knowledge-db")
     if args.knowledge_db is not None:
@@ -108,18 +116,31 @@ def main() -> None:
     if args.prompt is not None and args.knowledge_db is not None and not args.knowledge_db.is_file():
         parser.error("The knowledge database does not exist. Run the warm-up tasks first.")
 
+    warmup_prompts = []
+    if args.warmup_file is not None:
+        if args.knowledge_db is None or args.prompt is not None:
+            parser.error("--warmup-file requires --knowledge-db and cannot be combined with --prompt")
+        try:
+            warmup_prompts = [
+                line.strip() for line in args.warmup_file.read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
+        except (OSError, UnicodeError) as exc:
+            parser.error(f"Warm-up file: {exc}")
+        if not warmup_prompts:
+            parser.error("Warm-up file must contain at least one prompt")
+        warmup_prompts = warmup_prompts[:args.tasks]
     with ExitStack() as resources:
-        run_configured(args, parser, resources)
+        run_configured(args, parser, resources, warmup_prompts)
 
 
-def run_configured(args: argparse.Namespace, parser: argparse.ArgumentParser, resources: ExitStack) -> None:
+def run_configured(
+    args: argparse.Namespace, parser: argparse.ArgumentParser, resources: ExitStack, warmup_prompts: list[str],
+) -> None:
     tavily_key = os.environ.get("TAVILY_API_KEY", "").strip() if args.mode == "api" else ""
     if args.web_search and not tavily_key:
         parser.error("Set TAVILY_API_KEY to use --web-search")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"mode": args.mode, "run_status": "running"}]).to_csv(
-        args.output_dir / "summary.csv", index=False
-    )
+    write_reports(args.output_dir, None, {"mode": args.mode, "run_status": "running"}, args.mode)
     api_options = {}
     if args.mode == "api":
         try:
@@ -153,8 +174,11 @@ def run_configured(args: argparse.Namespace, parser: argparse.ArgumentParser, re
             )
             resources.callback(knowledge.close)
             if args.prompt is not None and not knowledge.ready:
+                agents, controllers, prompts = knowledge.coverage()
                 raise ValueError(
-                    f"MVP warm-up incomplete: {knowledge.completed_rounds}/{knowledge.mvp_rounds} rounds."
+                    f"MVP warm-up incomplete: {knowledge.completed_rounds}/{knowledge.mvp_rounds} rounds; "
+                    f"{len(agents)}/{args.agents} agents, {len(controllers)}/{args.controllers} controllers, "
+                    f"{prompts}/2 distinct prompts. Coverage is checked at the end of a round."
                 )
         except (OSError, sqlite3.Error, ValueError) as exc:
             write_reports(args.output_dir, None, {"mode": args.mode, "run_status": "failed"}, args.mode)
@@ -178,7 +202,7 @@ def run_configured(args: argparse.Namespace, parser: argparse.ArgumentParser, re
         knowledge=knowledge,
         **api_options,
     )
-    if args.prompt is None:
+    if args.prompt is None and not warmup_prompts:
         task_count = args.tasks if args.tasks is not None else (1 if args.mode == "api" else 200)
         tasks = orchestrator.generate_batched_stream(
             task_count,
@@ -186,33 +210,46 @@ def run_configured(args: argparse.Namespace, parser: argparse.ArgumentParser, re
             tick_duration=args.tick_duration,
         )
     else:
+        prompts = [args.prompt] if args.prompt is not None else warmup_prompts
         tasks = [Task(
-            id=0,
-            type=TaskType.QA if args.web_search else orchestrator.classifier.predict_from_text(args.prompt),
-            t_arrival=0.0,
+            id=index,
+            type=TaskType.QA if args.web_search else orchestrator.classifier.predict_from_text(prompt),
+            t_arrival=(index // args.batch_size) * args.tick_duration,
             h_Ti=3.0,
-            phi_i=SemanticFeatureExtractor.extract(args.prompt),
+            phi_i=SemanticFeatureExtractor.extract(prompt),
             urgency=0.5,
-            text=args.prompt,
+            text=prompt,
             requires_web_search=args.web_search,
-        )]
+        ) for index, prompt in enumerate(prompts)]
     error = None
+    exit_code = 1
+    status = "completed"
     started = time.perf_counter()
     try:
         summary = orchestrator.run(tasks)
     except (BudgetExceeded, JudgeEvaluationError, sqlite3.Error) as exc:
         summary = orchestrator.collect_summary()
         error = str(exc)
-    summary.update(mode=args.mode, run_status="failed" if error is not None else "completed")
+        status = "failed"
+    except KeyboardInterrupt:
+        summary = orchestrator.collect_summary()
+        error = "Run interrupted. Collected results were saved."
+        exit_code = 130
+        status = "interrupted"
     if args.mode == "api":
         summary["wall_run_seconds"] = time.perf_counter() - started
         failed_calls = int(summary["api_failed_calls"])
-        if failed_calls and error is None:
-            summary["run_status"] = "failed" if failed_calls == len(tasks) else "partial"
-            error = f"{failed_calls} agent API call(s) failed. See the log and report for details."
+        unsuccessful = sum(not row["success"] for row in orchestrator.task_records)
+        if unsuccessful and error is None:
+            status = "failed" if unsuccessful == len(tasks) else "partial"
+            error = (
+                f"{unsuccessful} task(s) had no accepted result ({failed_calls} agent API failure(s)). "
+                "See the run reports for details."
+            )
+    summary.update(mode=args.mode, run_status=status)
     write_reports(args.output_dir, orchestrator, summary, args.mode)
     if error is not None:
-        parser.exit(1, f"{error}\n")
+        parser.exit(exit_code, f"{error}\n")
     if args.prompt is None:
         print(pd.Series(summary).to_string())
     else:

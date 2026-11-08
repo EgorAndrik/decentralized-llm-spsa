@@ -16,10 +16,10 @@ import matplotlib.pyplot as plt
 from collections import deque
 
 try:
-    from .spsa_variants import call_variant, reset_state as _reset_spsa_state, VARIANT_DESCRIPTIONS
+    from .spsa_variants import call_variant, reset_state as _reset_spsa_state, VARIANT_DESCRIPTIONS, task_feature_vector
     from .llm_api import BudgetExceeded
 except ImportError:
-    from spsa_variants import call_variant, reset_state as _reset_spsa_state, VARIANT_DESCRIPTIONS
+    from spsa_variants import call_variant, reset_state as _reset_spsa_state, VARIANT_DESCRIPTIONS, task_feature_vector
     from llm_api import BudgetExceeded
 
 # =============================================================================
@@ -121,6 +121,7 @@ class ControllerObservation:
     true_time: float
     true_wait: float
     features: np.ndarray
+    num_types: int = 5
 
 
 @dataclass
@@ -180,13 +181,6 @@ def _pressure_routing_weights(cost_weight: float=0.0) -> np.ndarray:
     return weights / max(total, 1e-8)
 
 
-def _task_feature_vector(task_type: int, features: np.ndarray, num_types: int=5) -> np.ndarray:
-    x = np.zeros(num_types)
-    x[task_type] = 1.0
-    x[min(num_types - 1, 4)] = np.mean(features)
-    return x
-
-
 def _spsa_proc_loss(theta: np.ndarray, obs: deque, eps0: float=0.05) -> float:
     """Raw MSE for F1 — identical to spsa_variants._proc_loss so all methods
     optimise the same objective."""
@@ -194,7 +188,7 @@ def _spsa_proc_loss(theta: np.ndarray, obs: deque, eps0: float=0.05) -> float:
         return 0.0
     losses = []
     for o in list(obs)[-25:]:
-        x = _task_feature_vector(o.task_type, o.features, len(theta))
+        x = task_feature_vector(o.task_type, o.features, len(theta), getattr(o, "num_types", 5))
         pred = float(theta @ x)
         losses.append((pred - o.true_time) ** 2)
     return float(np.mean(losses))
@@ -206,7 +200,7 @@ def _spsa_wait_loss(theta: np.ndarray, obs: deque, delta: float=0.1) -> float:
         return 0.0
     losses = []
     for o in list(obs)[-25:]:
-        x = _task_feature_vector(o.task_type, o.features, len(theta))
+        x = task_feature_vector(o.task_type, o.features, len(theta), getattr(o, "num_types", 5))
         pred = float(theta @ x)
         slack = pred - o.true_wait - delta
         losses.append(max(0.0, -slack) ** 2)
@@ -229,12 +223,12 @@ class AdaptiveController:
         self.num_types = num_types
         
         # RLS для времени выполнения J₁(θ)
-        self.theta_time = np.ones(num_types) * 2.0
-        self.P_time = 100.0 * np.eye(num_types)
+        self.theta_time = np.ones(num_types + 1) * 2.0
+        self.P_time = 100.0 * np.eye(num_types + 1)
         
         # RLS для допустимого ожидания J₂(θ)
-        self.theta_wait = np.ones(num_types) * 1.5  
-        self.P_wait = 100.0 * np.eye(num_types)
+        self.theta_wait = np.ones(num_types + 1) * 1.5
+        self.P_wait = 100.0 * np.eye(num_types + 1)
 
         # RLS для предсказания качества исхода Q̂ ∈ [0,1] по семантике и паре (задача, агент)
         self.theta_quality = np.ones(9) * 0.5
@@ -259,18 +253,17 @@ class AdaptiveController:
         
     def predict_time(self, task_type: int, features: np.ndarray) -> float:
         """p̂(θ,x) = θᵀx (one-hot + признаки)"""
-        x = np.zeros(self.num_types); x[task_type] = 1.0
-        x[4] = np.mean(features)  # Простая агрегация признаков
+        x = task_feature_vector(task_type, features, len(self.theta_time), self.num_types)
         return np.clip(np.dot(self.theta_time, x), 0.5, 10.0)
     
     def predict_wait(self, task_type: int, features: np.ndarray) -> float:
-        x = np.zeros(self.num_types); x[task_type] = 1.0
-        x[4] = np.mean(features)
+        x = task_feature_vector(task_type, features, len(self.theta_wait), self.num_types)
         return np.clip(np.dot(self.theta_wait, x), 0.3, 5.0)
     
     def rls_update(self, task_type: int, true_time: float, true_wait: float, features: np.ndarray):
         """ТОЧНАЯ RLS формула со забыванием"""
-        x = np.zeros(self.num_types); x[task_type] = 1.0; x[4] = np.mean(features)
+        x = task_feature_vector(task_type, features, len(self.theta_time), self.num_types)
+        self.P_time = self.P_time[:len(x), :len(x)]
         
         # Обновление θ_time (J₁)
         denom = self.lambda_forget + x @ self.P_time @ x
@@ -280,13 +273,15 @@ class AdaptiveController:
         self.P_time = (self.P_time - np.outer(K, x.T @ self.P_time)) / self.lambda_forget
         
         # Обновление θ_wait (J₂)  
+        x = task_feature_vector(task_type, features, len(self.theta_wait), self.num_types)
+        self.P_wait = self.P_wait[:len(x), :len(x)]
         denom_wait = self.lambda_forget + x @ self.P_wait @ x
         K_wait = (self.P_wait @ x) / denom_wait
         error_wait = true_wait - self.theta_wait @ x
         self.theta_wait += K_wait * error_wait
         self.P_wait = (self.P_wait - np.outer(K_wait, x.T @ self.P_wait)) / self.lambda_forget
         
-        self.obs_history.append(ControllerObservation(task_type, true_time, true_wait, features))
+        self.obs_history.append(ControllerObservation(task_type, true_time, true_wait, features, self.num_types))
 
     def predict_quality(self, task_type: int, phi_i: np.ndarray, psi_k: np.ndarray, p_hat: float, w_hat: float) -> float:
         """Q̂ = clip(θ_Q^T z, 0, 1) — ожидаемое качество назначения до вызова судьи."""
@@ -388,7 +383,7 @@ def mse(theta: np.ndarray, obs: deque, target_idx: int) -> float:
             return 0.0
         errs = []
         for o in list(obs)[-25:]:
-            x = _task_feature_vector(o.task_type, o.features, len(theta))
+            x = task_feature_vector(o.task_type, o.features, len(theta), getattr(o, "num_types", 5))
             errs.append((float(theta @ x) - o.true_time) ** 2)
         return float(np.mean(errs))
     else:
@@ -596,6 +591,15 @@ class JudgeEvaluationError(RuntimeError):
     """The API judge could not produce an evaluation in strict mode."""
 
 
+def _unique_judge_fields(pairs):
+    fields = {}
+    for key, value in pairs:
+        if key in fields:
+            raise JudgeParseError(f"duplicate judge field {key!r}")
+        fields[key] = value
+    return fields
+
+
 class JudgeFallback:
     """Судья: численная обратная связь Q ∈ [0,1] для калибровки предиктора контроллера."""
 
@@ -651,20 +655,15 @@ class JudgeFallback:
             txt = str(output or "").strip()
             if not txt:
                 raise JudgeParseError("empty judge output")
-            obj = None
-            decoder = json.JSONDecoder()
-            for m in re.finditer(r"\{", txt):
-                try:
-                    candidate, _ = decoder.raw_decode(txt, m.start())
-                except ValueError:
-                    continue
-                if isinstance(candidate, dict) and any(
-                    k in candidate for k in ("quality_score", "quality", "Q")
-                ):
-                    obj = candidate
-                    break
-            if obj is None:
-                raise JudgeParseError("no JSON object with a quality score in judge output")
+            fence = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```", txt, re.DOTALL | re.IGNORECASE)
+            if fence:
+                txt = fence.group(1)
+            try:
+                obj = json.loads(txt, object_pairs_hook=_unique_judge_fields)
+            except json.JSONDecodeError as exc:
+                raise JudgeParseError("judge must return exactly one JSON object") from exc
+            if not isinstance(obj, dict):
+                raise JudgeParseError("judge must return a JSON object")
 
         quality = self._score(obj, "quality_score", "quality", "Q")
         verdict = str(obj.get("verdict", "pass" if quality >= 0.6 else "fail")).strip().lower()
@@ -740,6 +739,7 @@ class JudgeFallback:
         allow_heuristic_fallback: bool=True,
     ) -> Dict[str, float]:
         self.last_api_usage = None
+        llm_verdict = None
         t_idx = subtask.type.value
         expected_time = self.profiles[agent_id].tau_avg[t_idx] * (1.0 + subtask.h_Ti / 10.0)
         T_i = float(np.exp(-max(0.0, latency - expected_time) / max(expected_time, 1e-6)))
@@ -758,6 +758,7 @@ class JudgeFallback:
             # Пытаемся получить Q от отдельной модели-судьи.
             try:
                 judge_llm = self._evaluate_with_llm_judge(agent_id, subtask, latency, base_success, model_output)
+                llm_verdict = judge_llm["verdict"]
                 semantic_q = float(np.clip(judge_llm["quality_score"], 0.0, 1.0))
                 S_i = 1.0 if judge_llm["verdict"] == "pass" else 0.0
                 conf = float(np.clip(judge_llm["confidence"], 0.0, 1.0))
@@ -781,7 +782,7 @@ class JudgeFallback:
                 Q = self.ALPHA_Q * S_i + self.BETA_Q * T_i
 
         verdict_score = float(np.clip(0.70 * Q + 0.20 * S_i + 0.10 * T_i, 0.0, 1.0))
-        verdict = 1.0 if verdict_score >= self.SUCCESS_THRESHOLD else 0.0
+        verdict = float(llm_verdict != "fail" and verdict_score >= self.SUCCESS_THRESHOLD)
         if self.adaptive_feedback:
             soft_feedback = float(np.clip(0.65 * verdict_score + 0.25 * S_i + 0.10 * base_success, 0.0, 1.0))
             self.alpha[agent_id, t_idx] += soft_feedback
@@ -796,6 +797,7 @@ class JudgeFallback:
             "T": T_i,
             "confidence": conf,
             "success": verdict,
+            "judge_verdict": llm_verdict,
             "verdict_score": verdict_score,
             "quality": Q,
         }
@@ -815,6 +817,7 @@ def rank_agents(
     top_k: int=3,
     variant: Optional[SimulationVariant]=None,
     agent_profiles: Sequence[AgentProfile] = PROFILES,
+    api_input_prices: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, float]]:
     """R_{j,i} + A_{j,i} кластеринг (стр. 6-7 статьи)"""
     variant = variant or SimulationVariant()
@@ -868,8 +871,11 @@ def rank_agents(
         time_score = float(np.exp(-theor_time / max(predicted_time + 0.5, 0.5)))
         queue_score = float(np.exp(-predicted_wait_agent / max(predicted_wait + 0.5, 0.5)))
 
-        price_per_1k = MODEL_TOKEN_PRICE.get(profile.model_name, 0.5)
-        task_price = price_per_1k * (task_tokens / 1000.0)
+        if api_input_prices is None:
+            task_price = MODEL_TOKEN_PRICE.get(profile.model_name, 0.5) * task_tokens / 1000.0
+        else:
+            # Before execution we have only an estimate of the prompt length.
+            task_price = api_input_prices.get(profile.model_name, 0.0) * task_tokens / 1_000_000
         cost_score = np.exp(-task_price / 0.3)
 
         # Репутация агента по типу задачи на основе обратной связи судьи.

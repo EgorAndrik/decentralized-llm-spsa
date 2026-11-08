@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import itertools
 import logging
@@ -143,7 +144,7 @@ class BufferedOrchestrator(ExactOrchestrator):
                 load += 1.0 + 0.5 * float(task.urgency)
         return load
 
-    def _select_controller_by_load_balancing(self, task: Task) -> int:
+    def _select_controller_by_load_balancing(self, task: Task, seen_controllers: frozenset[int] = frozenset()) -> int:
         """LVP-style assignment of one task to one responsible controller."""
         if len(self.controllers) == 1:
             return 0
@@ -160,6 +161,7 @@ class BufferedOrchestrator(ExactOrchestrator):
         return min(
             range(len(states)),
             key=lambda idx: (
+                idx in seen_controllers,
                 0.70 * states[idx].q_jt + 0.30 * states[idx].q_jt_next,
                 self.controller_assignment_counts[idx],
                 idx,
@@ -187,7 +189,9 @@ class BufferedOrchestrator(ExactOrchestrator):
         )
         routed_task = replace(task, type=predicted_type)
         task_kind = "WEB_SEARCH" if task.requires_web_search else predicted_type.name
-        controller_id = self._select_controller_by_load_balancing(routed_task)
+        warmup = self.knowledge is not None and not task.requires_web_search and not self.knowledge.ready
+        seen_agents, seen_controllers, _ = self.knowledge.coverage() if warmup else (set(), set(), 0)
+        controller_id = self._select_controller_by_load_balancing(routed_task, frozenset(seen_controllers))
         controller = self.controllers[controller_id]
         self.controller_assignment_counts[controller_id] += 1
 
@@ -200,6 +204,19 @@ class BufferedOrchestrator(ExactOrchestrator):
             controller, raw_w, controller.wait_bias, controller.wait_conf, 0.3, 5.0
         )
 
+        api_input_prices = None
+        if self.llm_api_client is not None:
+            prices = getattr(self.llm_api_client, "token_prices", {})
+            aliases = getattr(self.llm_api_client, "model_aliases", {})
+            api_input_prices = {}
+            for agent in eligible:
+                name = self.agent_profiles[agent.id].model_name
+                rate = prices.get(aliases.get(name, name))
+                if rate is not None:
+                    api_input_prices[name] = rate[0]
+            if len(api_input_prices) != len(eligible):
+                # Avoid favouring an unknown tariff over a known one.
+                api_input_prices.clear()
         candidates = rank_agents(
             controller=controller,
             task=routed_task,
@@ -211,6 +228,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             top_k=len(eligible),
             variant=self.variant,
             agent_profiles=self.agent_profiles,
+            api_input_prices=api_input_prices,
         )
         # The buffer architecture requires every eligible pair. The adaptive
         # ranker may hard-filter low-reputation agents for urgent tasks, so add
@@ -228,6 +246,7 @@ class BufferedOrchestrator(ExactOrchestrator):
                 top_k=len(eligible),
                 variant=replace(self.variant, routing_mode="best_quality_static"),
                 agent_profiles=self.agent_profiles,
+                api_input_prices=api_input_prices,
             )
             candidates.extend(row for row in unfiltered if row["agent_id"] not in present)
 
@@ -252,6 +271,8 @@ class BufferedOrchestrator(ExactOrchestrator):
                 # Tavily usage is measured in credits, not in LLM tokens.
                 features[5] = 1.0
             base_score = float(np.dot(controller.routing_weights, features))
+            if warmup and candidate["agent_id"] not in seen_agents:
+                base_score += 1.0  # Try uncovered executors before declaring the pool ready.
             proposals.append(
                 CandidateProposal(
                     agent_id=int(candidate["agent_id"]),
@@ -303,6 +324,9 @@ class BufferedOrchestrator(ExactOrchestrator):
         self.metrics["assignments"] += 1
 
         result = self._execute_assignment(assignment, payload)
+        if self.knowledge is not None and not result.get("result_available", True):
+            task_kind = "WEB_SEARCH" if task.requires_web_search else payload.routed_task.type.name
+            self.knowledge.record_failure(assignment.controller_id, task_kind, agent.id)
         if self.llm_api_client is not None and not result["execution_failed"]:
             self.response_records.append({
                 "task_id": task.id,
@@ -379,6 +403,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             api_result = {"success": False}
         finished = time.perf_counter()
         success = bool(api_result.get("success", True))
+        output = str(api_result.get("output") or "")
         self.api_stats["calls"] += 1
         self.api_stats["failed"] += int(not success)
         cost = api_result.get("cost_usd")
@@ -396,7 +421,8 @@ class BufferedOrchestrator(ExactOrchestrator):
             "input_tokens": api_result.get("input_tokens"),
             "output_tokens": api_result.get("output_tokens"),
             "model_name": api_result.get("model_name", requested_model),
-            "model_output": str(api_result.get("output", "")),
+            "model_output": output,
+            "result_available": success and bool(output.strip()) and bool(api_result.get("result_available", True)),
             "semantic_match": self._cosine_similarity(task.phi_i, profile.psi_k),
             "synthetic_quality": None,
             "cost": cost,
@@ -429,13 +455,14 @@ class BufferedOrchestrator(ExactOrchestrator):
         selected_candidate = buffered.proposals[agent.id].proposal
 
         execution_failed = bool(result.get("execution_failed", False))
+        result_available = bool(result.get("result_available", not execution_failed))
         api_mode = self.llm_api_client is not None
         judge_usage = None
         judge_attempted = False
         judge_latency = None
         previous_evaluations = self.judge.judge_stats["llm_ok"]
-        if self.strict_judge and execution_failed:
-            # A failed API call leaves no answer for the judge to evaluate.
+        if self.strict_judge and not result_available:
+            # A failed call or empty search leaves no answer for the judge.
             verdict = {"Q": 0.0, "success": False}
         else:
             judge_started = time.perf_counter() if api_mode else None
@@ -457,13 +484,15 @@ class BufferedOrchestrator(ExactOrchestrator):
                     judge_latency = time.perf_counter() - judge_started
                     self._api_costs.append((judge_usage or {}).get("cost_usd"))
         quality = float(verdict["Q"])
-        success = bool(verdict["success"]) and not execution_failed
-        if self.knowledge is not None and not execution_failed and (
+        success = bool(verdict["success"]) and result_available
+        if self.knowledge is not None and result_available and (
             not api_mode or self.judge.judge_stats["llm_ok"] > previous_evaluations
         ):
+            text = " ".join(task.text.casefold().split())
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest() if text else None
             round_number = self.knowledge.record(
-                controller.id, task_kind, agent.id,
-                success=success, quality=quality, service_seconds=float(result["service_time"]),
+                controller.id, task_kind, agent.id, success=success, quality=quality,
+                service_seconds=float(result["service_time"]), prompt_digest=digest,
             )
             if round_number is not None:
                 self.event_records.append({
@@ -471,7 +500,7 @@ class BufferedOrchestrator(ExactOrchestrator):
                 })
         latency = float(result["response_latency"])
         actual_wait = float(result["actual_wait"])
-        deadline_hit = float(not execution_failed and event.finish_time <= buffered.deadline)
+        deadline_hit = float((success if api_mode else not execution_failed) and event.finish_time <= buffered.deadline)
         cost = result["cost"]
         api_record = {}
         timing = {
@@ -493,6 +522,8 @@ class BufferedOrchestrator(ExactOrchestrator):
                 cost = cost + judge_cost if cost is not None and judge_cost is not None else None
             api_record = {
                 "execution_failed": execution_failed,
+                "result_available": result_available,
+                "judge_verdict": verdict.get("judge_verdict"),
                 "input_tokens": result["input_tokens"],
                 "output_tokens": result["output_tokens"],
                 "worker_cost_usd": result["cost"],
@@ -516,7 +547,7 @@ class BufferedOrchestrator(ExactOrchestrator):
                 "finish_time": wall_finished,
                 "service_time": result["wall_worker_finished"] - result["wall_worker_started"],
             }
-            deadline_hit = float(not execution_failed and wall_finished <= wall_deadline)
+            deadline_hit = float(success and wall_finished <= wall_deadline)
         utility = self._compute_observed_utility(
             q_true=quality,
             success=success,
@@ -741,11 +772,16 @@ class BufferedOrchestrator(ExactOrchestrator):
         if self.knowledge is not None:
             observations = self.knowledge.observations
             rounds = observations // self.knowledge.round_size
+            agents, controllers, prompts = self.knowledge.coverage()
             summary.update(
                 knowledge_observations=observations,
                 knowledge_rounds=rounds,
+                knowledge_failures=self.knowledge.failures,
+                knowledge_agents_covered=len(agents),
+                knowledge_controllers_covered=len(controllers),
+                knowledge_distinct_prompts=prompts,
                 mvp_required_rounds=self.knowledge.mvp_rounds,
-                mvp_ready=rounds >= self.knowledge.mvp_rounds,
+                mvp_ready=self.knowledge.ready,
             )
         if self.llm_api_client is not None:
             unknown = self._api_costs.count(None)

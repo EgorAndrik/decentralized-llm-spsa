@@ -136,11 +136,12 @@ LLM_MAX_CALLS=10 python -m src.run_buffered_simulation --mode api --agents 2 \
 ```
 
 Both modes write task, event, feedback, and summary tables. In API mode,
-model answers go into `responses.jsonl`, keyed by task ID. A failed agent
-call never counts as a deadline hit. Agent failures give a nonzero exit
-code, and a judge or budget error stops the run. The summary records
-`run_status` (`running`, `completed`, `partial` or `failed`). Failed runs
-replace the previous reports and retain any results already collected.
+model answers go into `responses.jsonl`, keyed by task ID. Failed calls,
+empty results and answers rejected by the judge give a nonzero exit code.
+In API mode they also miss the deadline metric, and `--prompt` only prints
+an accepted answer. The summary records `run_status` (`running`, `completed`,
+`partial`, `failed` or `interrupted`). Reports are cleared at the start of a
+new run. On Ctrl+C the runner saves collected results and exits with code 130.
 
 API latency measures elapsed time from task submission to evaluation,
 including the judge. The scheduler still uses a virtual clock and sends
@@ -152,6 +153,8 @@ returned by the provider and `LLM_TOKEN_PRICES` (USD per million input
 and output tokens, keyed by provider model ID). When any call lacks
 usage or a price, the total is left blank and the summary reports the
 known subtotal and number of unpriced calls.
+Before dispatch, the router uses the configured input rates for its cost
+estimate. It omits the price comparison when a candidate's rate is unknown.
 
 #### Optional Tavily web search
 
@@ -186,14 +189,17 @@ Each controller records the count, outcome, judge score and execution time
 by task type and agent. Every `--round-size` evaluated tasks publish a shared
 snapshot across controllers. The router uses local estimates when available
 and the shared snapshot for pairs it has not seen. API failures without a
-judge score do not advance the round. No prompts or answers go into this database.
+judge score do not advance the round. Failure counts are saved separately
+and reduce the affected agent's estimate. The database stores a fingerprint
+for coverage checks. It stores no prompt text or answers.
 
-For example, collect three rounds of five tasks on the generated workload:
+For example, collect three rounds of five tasks using `prompts.txt` with
+one distinct representative prompt per line:
 
 ```bash
 LLM_MAX_CALLS=30 python -m src.run_buffered_simulation --mode api --agents 2 \
        --knowledge-db buffered_outputs/routing_knowledge.sqlite3 \
-       --round-size 5 --mvp-rounds 3 --tasks 15
+       --round-size 5 --mvp-rounds 3 --warmup-file prompts.txt --tasks 15
 ```
 
 After the summary shows `mvp_ready=True`, use the same database to route a
@@ -205,8 +211,13 @@ python -m src.run_buffered_simulation --mode api --agents 2 \
        --prompt "Explain optimistic locking in two sentences."
 ```
 
-The database keeps incomplete rounds, so another batch can finish the
-warm-up. Use a separate database for simulation or a different model pool.
+MVP readiness is published at a round boundary and also requires at least
+two distinct evaluated prompts and an evaluation for every configured LLM
+agent and controller. Search feedback
+does not cover an LLM slot. The database keeps incomplete rounds, so another
+batch can finish the warm-up. Existing databases keep their observations and
+need new evaluations to establish prompt diversity. Use a separate database
+for simulation or a different model pool.
 Knowledge rounds publish routing statistics and are separate from the
 existing A-SPSA parameter synchronization rounds.
 

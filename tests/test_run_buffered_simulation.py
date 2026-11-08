@@ -129,6 +129,37 @@ def test_judge_failure_replaces_stale_reports_and_keeps_paid_answer(tmp_path, mo
     assert json.loads((tmp_path / "responses.jsonl").read_text())["model_output"] == "=1+1"
 
 
+def test_rejected_answer_is_saved_but_not_returned_as_success(tmp_path, monkeypatch, capsys):
+    configure_api_run(
+        tmp_path, monkeypatch, ["--prompt", "Explain SQL."],
+        judge_output='{"quality_score": 0.95, "verdict": "fail"}',
+    )
+    with pytest.raises(SystemExit) as error:
+        run_buffered_simulation.main()
+    assert error.value.code == 1
+    assert not capsys.readouterr().out
+    row, = read_rows(tmp_path / "task_records.csv")
+    assert row["success"] == row["deadline_hit"] == "0"
+    assert row["judge_verdict"] == "fail"
+    assert row["execution_failed"] == "False"
+    assert read_rows(tmp_path / "summary.csv")[0]["run_status"] == "failed"
+
+
+def test_interrupt_clears_previous_run_responses(tmp_path, monkeypatch):
+    (tmp_path / "responses.jsonl").write_text('{"model_output": "old answer"}\n')
+    configure_api_run(tmp_path, monkeypatch, ["--prompt", "Explain SQL."])
+
+    def interrupt(**kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(llm_api, "HTTPClient", interrupt)
+    with pytest.raises(SystemExit) as error:
+        run_buffered_simulation.main()
+    assert error.value.code == 130
+    assert read_rows(tmp_path / "summary.csv")[0]["run_status"] == "interrupted"
+    assert not (tmp_path / "responses.jsonl").read_text()
+
+
 def test_failed_worker_calls_miss_deadlines_and_return_error(tmp_path, monkeypatch):
     db = tmp_path / "knowledge.sqlite3"
     calls = configure_api_run(
@@ -148,14 +179,18 @@ def test_failed_worker_calls_miss_deadlines_and_return_error(tmp_path, monkeypat
     assert int(summary["unpriced_api_calls"]) == 2
     assert summary["total_cost"] == ""
     assert summary["knowledge_observations"] == "0"
+    assert summary["knowledge_failures"] == "2"
     assert not (tmp_path / "responses.jsonl").read_text()
 
 
 def test_mvp_prompt_requires_completed_rounds_from_persistent_knowledge(tmp_path, monkeypatch, capsys):
-    db_args = ["--knowledge-db", str(tmp_path / "knowledge.sqlite3")]
+    db_args = ["--knowledge-db", str(tmp_path / "knowledge.sqlite3"), "--controllers", "2"]
+    warmup_file = tmp_path / "prompts.txt"
+    warmup_file.write_text("Explain SQL joins.\n")
+    warmup_args = [*db_args, "--warmup-file", str(warmup_file)]
     verdict = '{"quality_score": 0.95}'
     configure_api_run(
-        tmp_path, monkeypatch, [*db_args, "--round-size", "2", "--mvp-rounds", "1", "--tasks", "1"],
+        tmp_path, monkeypatch, [*warmup_args, "--round-size", "2", "--mvp-rounds", "1"],
         judge_output=verdict,
     )
     run_buffered_simulation.main()
@@ -170,7 +205,8 @@ def test_mvp_prompt_requires_completed_rounds_from_persistent_knowledge(tmp_path
     assert "0/1 rounds" in capsys.readouterr().err
     assert not calls
 
-    configure_api_run(tmp_path, monkeypatch, [*db_args, "--tasks", "1"], judge_output=verdict)
+    warmup_file.write_text("Translate to Spanish: hello.\n")
+    configure_api_run(tmp_path, monkeypatch, warmup_args, judge_output=verdict)
     run_buffered_simulation.main()
     summary, = read_rows(tmp_path / "summary.csv")
     assert summary["mvp_ready"] == "True"
@@ -205,7 +241,7 @@ def test_tavily_routes_search_via_buffer_and_shares_api_budget(tmp_path, monkeyp
     verdict = '{"quality_score": 0.95, "verdict": "pass"}'
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     configure_api_run(
-        tmp_path, monkeypatch, [*db_args, "--tasks", "1", "--round-size", "1", "--mvp-rounds", "1"],
+        tmp_path, monkeypatch, [*db_args, "--tasks", "5", "--round-size", "5", "--mvp-rounds", "1"],
         judge_output=verdict,
     )
     run_buffered_simulation.main()
@@ -257,7 +293,7 @@ def test_tavily_routes_search_via_buffer_and_shares_api_budget(tmp_path, monkeyp
     assert len(search_calls) == 1
     summary, = read_rows(tmp_path / "summary.csv")
     assert summary["tavily_calls"] == summary["tavily_known_credits"] == "1"
-    assert summary["knowledge_observations"] == str(max_calls)
+    assert summary["knowledge_observations"] == str(4 + max_calls)
     response = json.loads((tmp_path / "responses.jsonl").read_text())
     assert response["model_name"] == "tavily-search"
     assert source_url in response["model_output"]
@@ -285,3 +321,19 @@ def test_tavily_redirect_is_a_failed_assignment_and_does_not_call_judge(tmp_path
     task, = read_rows(tmp_path / "task_records.csv")
     assert task["execution_failed"] == "True"
     assert task["deadline_hit"] == "0"
+
+
+def test_tavily_no_sources_does_not_count_as_api_error_or_accepted_answer(tmp_path, monkeypatch):
+    llm_calls = configure_api_run(tmp_path, monkeypatch, ["--web-search", "--prompt", "Find Python docs."])
+    monkeypatch.setenv("TAVILY_API_KEY", "search-key")
+    monkeypatch.setattr(tavily_search, "HTTPClient", lambda **kwargs: httpx.Client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"results": [], "usage": {"credits": 1}})),
+        **kwargs,
+    ))
+    with pytest.raises(SystemExit) as error:
+        run_buffered_simulation.main()
+    assert error.value.code == 1
+    assert not llm_calls
+    task, = read_rows(tmp_path / "task_records.csv")
+    assert task["execution_failed"] == task["result_available"] == "False"
+    assert task["success"] == task["deadline_hit"] == "0"

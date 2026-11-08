@@ -389,14 +389,20 @@ def build_llmrouterbench(root: Path = EXTERNAL):
     return items, outcomes, reference
 
 
-def _finish(items: pd.DataFrame, outcomes: pd.DataFrame, domains: tuple[str, ...]):
+def _complete_outcomes(outcomes: pd.DataFrame) -> pd.DataFrame:
     # A prompt with a missing outcome for any model cannot be replayed as a
     # full counterfactual row, so it is dropped rather than imputed.
-    complete = outcomes.dropna(subset=["quality", "output_tokens", "cost_usd"])
+    metrics = ["quality", "input_tokens", "output_tokens", "cost_usd"]
+    values = outcomes[metrics].to_numpy(dtype=float, na_value=np.nan)
+    complete = outcomes[np.isfinite(values).all(axis=1) & (values >= 0).all(axis=1)]
     counts = complete.groupby("item_id")["model"].nunique()
     keep = counts[counts == outcomes["model"].nunique()].index
-    items = items[items["item_id"].isin(keep)].reset_index(drop=True)
-    outcomes = complete[complete["item_id"].isin(keep)].reset_index(drop=True)
+    return complete[complete["item_id"].isin(keep)].reset_index(drop=True)
+
+
+def _finish(items: pd.DataFrame, outcomes: pd.DataFrame, domains: tuple[str, ...]):
+    outcomes = _complete_outcomes(outcomes)
+    items = items[items["item_id"].isin(outcomes["item_id"])].reset_index(drop=True)
     items["domain"] = items["domain_name"].map({name: i for i, name in enumerate(domains)}).astype(int)
     items["split"] = items["item_id"].map(_split_of)
     outcomes["success"] = outcomes["quality"] >= 0.5
@@ -436,7 +442,9 @@ def load(name: str, root: Path = EXTERNAL) -> tuple[pd.DataFrame, pd.DataFrame]:
     out = root / "processed"
     items_path, outcomes_path = out / f"{name}_items.parquet", out / f"{name}_outcomes.parquet"
     if items_path.exists() and outcomes_path.exists():
-        return pd.read_parquet(items_path), pd.read_parquet(outcomes_path)
+        outcomes = _complete_outcomes(pd.read_parquet(outcomes_path))
+        items = pd.read_parquet(items_path)
+        return items[items["item_id"].isin(outcomes["item_id"])].reset_index(drop=True), outcomes
     built = BUILDERS[name](root)
     items, outcomes = built[0], built[1]
     out.mkdir(parents=True, exist_ok=True)

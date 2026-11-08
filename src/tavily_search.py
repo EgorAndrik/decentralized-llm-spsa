@@ -77,7 +77,7 @@ class TavilySearchAgent:
             output = "No web sources found."
         return {
             "output": output, "model_name": self.name, "success": True,
-            "latency": latency, "search_credits": credits,
+            "latency": latency, "search_credits": credits, "result_available": bool(sources),
         }
 
 

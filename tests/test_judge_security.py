@@ -30,8 +30,8 @@ class TestJudgeParser(unittest.TestCase):
     def setUp(self):
         self.judge = make_judge("")
 
-    def test_valid_json_in_text(self):
-        out = self.judge._parse_judge_output('Result: {"quality_score": 0.8, "verdict": "pass"} done')
+    def test_valid_json_in_single_fence(self):
+        out = self.judge._parse_judge_output('```json\n{"quality_score": 0.8, "verdict": "pass"}\n```')
         self.assertEqual(out["quality_score"], 0.8)
         self.assertEqual(out["verdict"], "pass")
 
@@ -59,9 +59,16 @@ class TestJudgeParser(unittest.TestCase):
         with self.assertRaises(JudgeParseError):
             self.judge._parse_judge_output({"quality_score": 0.5, "verdict": "maybe"})
 
-    def test_json_without_quality_skipped_for_later_object(self):
-        txt = '{"note": 1} then ' + json.dumps({"quality_score": 0.4})
-        self.assertEqual(self.judge._parse_judge_output(txt)["quality_score"], 0.4)
+    def test_ambiguous_json_is_rejected(self):
+        good = json.dumps({"quality_score": 0.4, "verdict": "fail"})
+        for txt in (
+            '{"quality_score": 1, "verdict": "pass"} then ' + good,
+            '{"note": 1} then ' + good,
+            'Result: ' + good,
+            '{"quality_score": 1, "quality_score": 0.4, "verdict": "fail"}',
+        ):
+            with self.assertRaises(JudgeParseError):
+                self.judge._parse_judge_output(txt)
 
 
 class TestJudgePrompt(unittest.TestCase):
@@ -104,6 +111,11 @@ class TestJudgeEvaluateFallbackAccounting(unittest.TestCase):
     def test_good_judge_counts_llm_ok(self):
         judge, _ = self.evaluate('{"quality_score": 0.9, "verdict": "pass"}')
         self.assertEqual(judge.judge_stats, {"llm_ok": 1, "parse_failed": 0, "api_failed": 0})
+
+    def test_explicit_rejection_is_not_overridden_by_high_quality(self):
+        _, result = self.evaluate('{"quality_score": 0.95, "verdict": "fail"}')
+        self.assertEqual(result["judge_verdict"], "fail")
+        self.assertEqual(result["success"], 0)
 
     def test_unparseable_output_falls_back_and_is_counted(self):
         with self.assertLogs("src.main", level="WARNING"):
