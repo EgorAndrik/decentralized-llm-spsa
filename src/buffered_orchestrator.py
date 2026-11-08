@@ -21,10 +21,12 @@ from .assignment_buffer import (
 from .main import (
     MODEL_TOKEN_PRICE,
     PROFILES,
+    AgentProfile,
     ControllerState,
     ExactOrchestrator,
     SimulationVariant,
     Task,
+    TaskType,
     exact_load_balancing,
     communication_graph,
     mse,
@@ -33,6 +35,7 @@ from .main import (
 from .llm_api import BudgetExceeded
 from .routing_knowledge import RoutingKnowledge
 from .spsa_variants import call_variant
+from .tavily_search import TavilySearchAgent
 
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,7 @@ class BufferedOrchestrator(ExactOrchestrator):
         classifier_seed: int = 42,
         strict_judge: bool = False,
         knowledge: RoutingKnowledge | None = None,
+        search_agent: TavilySearchAgent | None = None,
     ) -> None:
         variant = variant or SimulationVariant(
             name="global_buffer_aspsa",
@@ -86,13 +90,29 @@ class BufferedOrchestrator(ExactOrchestrator):
             spsa_interval=5,
             spsa_warmup_tasks=15,
         )
+        self.search_agent = search_agent
+        self.search_agent_id = None
+        profiles = PROFILES
+        if search_agent is not None:
+            if llm_api_client is None:
+                raise ValueError("Tavily search requires API mode.")
+            self.search_agent_id = num_agents
+            profiles = [*PROFILES[:num_agents], AgentProfile(
+                id=num_agents,
+                name="Tavily Search",
+                model_name=search_agent.name,
+                P_success=np.full(len(TaskType), 0.5),
+                tau_avg=np.ones(len(TaskType)),
+                psi_k=np.array([0.0, 1.0, 0.0, 0.0, 0.0]),
+            )]
         super().__init__(
             num_ctrl=num_ctrl,
-            num_agents=num_agents,
+            num_agents=num_agents + int(search_agent is not None),
             llm_api_client=llm_api_client,
             judge_model_name=judge_model_name,
             variant=variant,
             classifier_seed=classifier_seed,
+            agent_profiles=profiles,
         )
         self.buffer = GlobalAssignmentBuffer()
         self.routing_learning_rate = float(routing_learning_rate)
@@ -147,7 +167,13 @@ class BufferedOrchestrator(ExactOrchestrator):
         )
 
     def submit_task(self, task: Task) -> int:
-        """Classify, load-balance, score every task--agent pair, and buffer it."""
+        """Classify, load-balance, and score the workers that can execute the task."""
+        if task.requires_web_search and self.search_agent is None:
+            raise ValueError("Web search requires TAVILY_API_KEY in API mode.")
+        eligible = [
+            agent for agent in self.agents
+            if (agent.id == self.search_agent_id) == task.requires_web_search
+        ]
         wall_arrived = None
         if self.llm_api_client is not None:
             now = time.perf_counter()
@@ -155,11 +181,12 @@ class BufferedOrchestrator(ExactOrchestrator):
                 self._api_clock_start = now
             wall_arrived = now - self._api_clock_start
         self.time = float(task.t_arrival)
-        predicted_type = self.classifier.predict(task)
+        predicted_type = TaskType.QA if task.requires_web_search else self.classifier.predict(task)
         self.metrics["type_cls_acc"].append(
             1.0 if predicted_type == task.type else 0.0
         )
         routed_task = replace(task, type=predicted_type)
+        task_kind = "WEB_SEARCH" if task.requires_web_search else predicted_type.name
         controller_id = self._select_controller_by_load_balancing(routed_task)
         controller = self.controllers[controller_id]
         self.controller_assignment_counts[controller_id] += 1
@@ -176,29 +203,31 @@ class BufferedOrchestrator(ExactOrchestrator):
         candidates = rank_agents(
             controller=controller,
             task=routed_task,
-            agents=self.agents,
+            agents=eligible,
             time=self.time,
             dynamic_success=self.judge.dynamic_success,
             predicted_time=p_hat,
             predicted_wait=w_hat,
-            top_k=len(self.agents),
+            top_k=len(eligible),
             variant=self.variant,
+            agent_profiles=self.agent_profiles,
         )
-        # The buffer architecture requires every pair.  The legacy adaptive
+        # The buffer architecture requires every eligible pair. The adaptive
         # ranker may hard-filter low-reputation agents for urgent tasks, so add
         # any missing pair using the same feature computation without filtering.
         present = {row["agent_id"] for row in candidates}
-        if len(present) != len(self.agents):
+        if len(present) != len(eligible):
             unfiltered = rank_agents(
                 controller=controller,
                 task=routed_task,
-                agents=self.agents,
+                agents=eligible,
                 time=self.time,
                 dynamic_success=self.judge.dynamic_success,
                 predicted_time=p_hat,
                 predicted_wait=w_hat,
-                top_k=len(self.agents),
+                top_k=len(eligible),
                 variant=replace(self.variant, routing_mode="best_quality_static"),
+                agent_profiles=self.agent_profiles,
             )
             candidates.extend(row for row in unfiltered if row["agent_id"] not in present)
 
@@ -209,7 +238,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             predicted_quality = float(candidate["predicted_quality"])
             if self.knowledge is not None:
                 predicted_quality, predicted_processing = self.knowledge.estimate(
-                    controller_id, routed_task.type.name, int(candidate["agent_id"]),
+                    controller_id, task_kind, int(candidate["agent_id"]),
                     predicted_quality, predicted_processing,
                 )
                 features[2] = predicted_quality
@@ -219,6 +248,9 @@ class BufferedOrchestrator(ExactOrchestrator):
             features[1] = 0.0
             features[4] = 0.0
             features[7] = float(task.urgency)
+            if task.requires_web_search:
+                # Tavily usage is measured in credits, not in LLM tokens.
+                features[5] = 1.0
             base_score = float(np.dot(controller.routing_weights, features))
             proposals.append(
                 CandidateProposal(
@@ -227,7 +259,7 @@ class BufferedOrchestrator(ExactOrchestrator):
                     predicted_processing=predicted_processing,
                     predicted_quality=predicted_quality,
                     relevance=float(candidate["relevance"]),
-                    cost=float(candidate["task_price"]),
+                    cost=0.0 if task.requires_web_search else float(candidate["task_price"]),
                     feature_vector=tuple(float(x) for x in features),
                     predicted_wait_budget=float(w_hat),
                 )
@@ -310,7 +342,7 @@ class BufferedOrchestrator(ExactOrchestrator):
     def _execute_assignment(self, assignment: Assignment, payload: BufferedPayload) -> dict:
         task = payload.task
         agent = self.agents[assignment.agent_id]
-        profile = PROFILES[agent.id]
+        profile = self.agent_profiles[agent.id]
         if self.llm_api_client is None:
             result = self._simulate_no_api_execution(
                 task,
@@ -335,11 +367,14 @@ class BufferedOrchestrator(ExactOrchestrator):
             profile.model_name, profile.model_name
         )
         try:
-            api_result = self.llm_api_client.call(profile.model_name, prompt, task.type.name)
+            if agent.id == self.search_agent_id:
+                api_result = self.search_agent.search(task.text)
+            else:
+                api_result = self.llm_api_client.call(profile.model_name, prompt, task.type.name)
         except BudgetExceeded:
             raise  # лимит расходов должен остановить прогон, а не стать «сбоем исполнения»
         except Exception as exc:
-            logger.warning("LLM call to %s failed (%s: %s); task marked execution_failed",
+            logger.warning("API call to %s failed (%s: %s); task marked execution_failed",
                            requested_model, type(exc).__name__, exc)
             api_result = {"success": False}
         finished = time.perf_counter()
@@ -365,6 +400,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             "semantic_match": self._cosine_similarity(task.phi_i, profile.psi_k),
             "synthetic_quality": None,
             "cost": cost,
+            "search_credits": api_result.get("search_credits"),
             "wall_worker_started": started - self._api_clock_start,
             "wall_worker_finished": finished - self._api_clock_start,
         }
@@ -387,7 +423,8 @@ class BufferedOrchestrator(ExactOrchestrator):
         result = event.result
         controller = self.controllers[assignment.controller_id]
         agent = self.agents[assignment.agent_id]
-        profile = PROFILES[agent.id]
+        profile = self.agent_profiles[agent.id]
+        task_kind = "WEB_SEARCH" if task.requires_web_search else payload.routed_task.type.name
         buffered = self.buffer.tasks[task.id]
         selected_candidate = buffered.proposals[agent.id].proposal
 
@@ -425,7 +462,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             not api_mode or self.judge.judge_stats["llm_ok"] > previous_evaluations
         ):
             round_number = self.knowledge.record(
-                controller.id, payload.routed_task.type.name, agent.id,
+                controller.id, task_kind, agent.id,
                 success=success, quality=quality, service_seconds=float(result["service_time"]),
             )
             if round_number is not None:
@@ -469,6 +506,8 @@ class BufferedOrchestrator(ExactOrchestrator):
                 "scheduler_latency": result["response_latency"],
                 "scheduler_deadline_hit": deadline_hit,
             }
+            if task.requires_web_search:
+                api_record["tavily_credits"] = result["search_credits"]
             timing = {
                 "buffered_at": payload.wall_arrived,
                 "assigned_at": result["wall_worker_started"],
@@ -581,8 +620,8 @@ class BufferedOrchestrator(ExactOrchestrator):
             variant=self.variant.name,
             parent_id=task.id,
             local_id=0,
-            task_type=task.type.name,
-            classified_type=payload.routed_task.type.name,
+            task_type=task_kind if task.requires_web_search else task.type.name,
+            classified_type=task_kind,
             urgency=float(task.urgency),
             controller_id=controller.id,
             assigned=1,
@@ -694,6 +733,11 @@ class BufferedOrchestrator(ExactOrchestrator):
 
     def collect_summary(self):
         summary = super().collect_summary()
+        if self.search_agent is not None:
+            summary.update(
+                tavily_calls=self.search_agent.calls_made,
+                tavily_known_credits=self.search_agent.known_credits,
+            )
         if self.knowledge is not None:
             observations = self.knowledge.observations
             rounds = observations // self.knowledge.round_size

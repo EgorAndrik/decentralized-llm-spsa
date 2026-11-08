@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from contextlib import ExitStack
@@ -15,8 +16,9 @@ import pandas as pd
 
 from .buffered_orchestrator import BufferedOrchestrator
 from .llm_api import BudgetExceeded, LLMAPIClient, api_key_from_env, import_config_module
-from .main import PROFILES, JudgeEvaluationError, SemanticFeatureExtractor, SimulationVariant, Task
+from .main import PROFILES, JudgeEvaluationError, SemanticFeatureExtractor, SimulationVariant, Task, TaskType
 from .routing_knowledge import RoutingKnowledge
+from .tavily_search import TavilySearchAgent
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("simulation", "api"), default="simulation")
     parser.add_argument("--config", default="llm_config", help="API config module (llm_config*).")
     parser.add_argument("--prompt", help="Run one user prompt in API mode instead of the generated workload.")
+    parser.add_argument("--web-search", action="store_true", help="Route the prompt to Tavily (requires TAVILY_API_KEY).")
     parser.add_argument("--knowledge-db", type=Path, help="Persist routing experience in this SQLite file.")
     parser.add_argument("--round-size", type=int, help="Evaluated tasks per knowledge round (default: 5).")
     parser.add_argument("--mvp-rounds", type=int, help="Completed rounds before serving prompts (default: 3).")
@@ -92,6 +95,8 @@ def main() -> None:
         parser.error("--controllers must be positive")
     if args.prompt is not None and (args.mode != "api" or not args.prompt.strip()):
         parser.error("--prompt requires API mode and a non-empty prompt")
+    if args.web_search and (args.mode != "api" or args.prompt is None):
+        parser.error("--web-search requires --mode api and --prompt")
     if args.tasks is not None and args.tasks < 1:
         parser.error("--tasks must be positive")
     if args.knowledge_db is None and (args.round_size is not None or args.mvp_rounds is not None):
@@ -108,6 +113,9 @@ def main() -> None:
 
 
 def run_configured(args: argparse.Namespace, parser: argparse.ArgumentParser, resources: ExitStack) -> None:
+    tavily_key = os.environ.get("TAVILY_API_KEY", "").strip() if args.mode == "api" else ""
+    if args.web_search and not tavily_key:
+        parser.error("Set TAVILY_API_KEY to use --web-search")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([{"mode": args.mode, "run_status": "running"}]).to_csv(
         args.output_dir / "summary.csv", index=False
@@ -120,11 +128,15 @@ def run_configured(args: argparse.Namespace, parser: argparse.ArgumentParser, re
             write_reports(args.output_dir, None, {"mode": args.mode, "run_status": "failed"}, args.mode)
             parser.error(f"API configuration: {exc}")
         api_options = dict(llm_api_client=client, judge_model_name=judge_model, strict_judge=True)
+        if tavily_key:
+            api_options["search_agent"] = TavilySearchAgent(tavily_key, reserve_call=client.reserve_call)
 
     knowledge = None
     if args.knowledge_db is not None:
         agent_names = [profile.model_name for profile in PROFILES[:args.agents]]
         scope = {"mode": args.mode, "controllers": args.controllers, "agents": agent_names}
+        # The optional search worker reserves the slot after these LLMs. Its
+        # WEB_SEARCH experience can safely coexist in an existing database.
         if args.mode == "api":
             # Bind experience to the configured provider and model, without storing URLs or keys.
             scope["api_models"] = {
@@ -176,12 +188,13 @@ def run_configured(args: argparse.Namespace, parser: argparse.ArgumentParser, re
     else:
         tasks = [Task(
             id=0,
-            type=orchestrator.classifier.predict_from_text(args.prompt),
+            type=TaskType.QA if args.web_search else orchestrator.classifier.predict_from_text(args.prompt),
             t_arrival=0.0,
             h_Ti=3.0,
             phi_i=SemanticFeatureExtractor.extract(args.prompt),
             urgency=0.5,
             text=args.prompt,
+            requires_web_search=args.web_search,
         )]
     error = None
     started = time.perf_counter()

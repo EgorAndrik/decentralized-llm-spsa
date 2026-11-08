@@ -24,3 +24,5 @@ LLM_TOKEN_PRICES = {
 # (upper-case, with punctuation replaced by underscores), or populate
 # LLM_API_KEYS from a provider-specific environment variable using os.getenv.
 LLM_API_KEYS = {}
+
+# Optional web search worker: set TAVILY_API_KEY in the environment.

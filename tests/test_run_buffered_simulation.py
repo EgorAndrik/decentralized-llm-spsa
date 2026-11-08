@@ -6,7 +6,7 @@ import time
 import httpx
 import pytest
 
-from src import llm_api, llm_config_example, run_buffered_simulation
+from src import llm_api, llm_config_example, run_buffered_simulation, tavily_search
 
 
 def read_rows(path):
@@ -19,6 +19,8 @@ def test_default_mode_does_not_load_api_config(tmp_path, monkeypatch):
         pytest.fail("Simulation should not load API configuration")
 
     monkeypatch.setattr(run_buffered_simulation, "import_config_module", unexpected_api_config)
+    monkeypatch.setenv("TAVILY_API_KEY", "unused-key")
+    monkeypatch.setattr(tavily_search, "HTTPClient", unexpected_api_config)
     monkeypatch.setattr(sys, "argv", ["runner", "--tasks", "2", "--output-dir", str(tmp_path)])
 
     run_buffered_simulation.main()
@@ -68,6 +70,12 @@ def test_api_prompt_returns_answer_and_exports_usage(tmp_path, monkeypatch, caps
     calls = configure_api_run(
         tmp_path, monkeypatch, ["--prompt", prompt], judge_output='{"quality_score": 0.95, "verdict": "pass"}'
     )
+    monkeypatch.setenv("TAVILY_API_KEY", "unused-key")
+
+    def unexpected_search(**kwargs):
+        pytest.fail("Ordinary prompts should not contact Tavily")
+
+    monkeypatch.setattr(tavily_search, "HTTPClient", unexpected_search)
 
     run_buffered_simulation.main()
 
@@ -176,3 +184,104 @@ def test_mvp_prompt_requires_completed_rounds_from_persistent_knowledge(tmp_path
     run_buffered_simulation.main()
     assert capsys.readouterr().out.strip() == "=1+1"
     assert len(calls) == 2
+
+
+def test_web_search_requires_key_before_contacting_providers(tmp_path, monkeypatch, capsys):
+    calls = configure_api_run(tmp_path, monkeypatch, ["--web-search", "--prompt", "Find Python docs."])
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    with pytest.raises(SystemExit) as error:
+        run_buffered_simulation.main()
+
+    assert error.value.code == 2
+    assert "TAVILY_API_KEY" in capsys.readouterr().err
+    assert not calls
+
+
+@pytest.mark.parametrize("max_calls", [1, 2])
+def test_tavily_routes_search_via_buffer_and_shares_api_budget(tmp_path, monkeypatch, capsys, max_calls):
+    prompt = "Find the official Python TaskGroup docs."
+    db_args = ["--knowledge-db", str(tmp_path / "routing.sqlite3")]
+    verdict = '{"quality_score": 0.95, "verdict": "pass"}'
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    configure_api_run(
+        tmp_path, monkeypatch, [*db_args, "--tasks", "1", "--round-size", "1", "--mvp-rounds", "1"],
+        judge_output=verdict,
+    )
+    run_buffered_simulation.main()
+    capsys.readouterr()
+    llm_calls = configure_api_run(
+        tmp_path, monkeypatch, [*db_args, "--web-search", "--prompt", prompt], judge_output=verdict,
+    )
+    monkeypatch.setenv("TAVILY_API_KEY", "search-key")
+    monkeypatch.setenv("LLM_MAX_CALLS", str(max_calls))
+    search_calls = []
+    source_url = "https://docs.python.org/3/library/asyncio-task.html#task-groups"
+
+    def respond(request):
+        search_calls.append(request)
+        assert str(request.url) == "https://api.tavily.com/search"
+        assert request.headers["Authorization"] == "Bearer search-key"
+        payload = json.loads(request.content)
+        assert payload["query"] == prompt and payload["include_usage"]
+        return httpx.Response(200, json={
+            "answer": "TaskGroup waits for all of its tasks.",
+            "results": [
+                {"title": "Python docs", "url": source_url, "content": "An asynchronous context manager."},
+                {"title": "Invalid URL", "url": "javascript:alert(1)"},
+            ],
+            "usage": {"credits": 1},
+        })
+
+    monkeypatch.setattr(
+        tavily_search, "HTTPClient", lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    if max_calls == 1:
+        with pytest.raises(SystemExit) as error:
+            run_buffered_simulation.main()
+        assert error.value.code == 1
+        assert "budget" in capsys.readouterr().err
+        assert not llm_calls
+    else:
+        run_buffered_simulation.main()
+        assert source_url in capsys.readouterr().out
+        judge_call, = llm_calls
+        assert judge_call[2] and source_url in judge_call[1]
+        task, = read_rows(tmp_path / "task_records.csv")
+        assert task["agent_id"] == "2"
+        assert task["model_name"] == "tavily-search"
+        assert task["task_type"] == "WEB_SEARCH"
+        assert task["tavily_credits"] == "1"
+        assert any(row["event"] == "assigned" for row in read_rows(tmp_path / "event_records.csv"))
+
+    assert len(search_calls) == 1
+    summary, = read_rows(tmp_path / "summary.csv")
+    assert summary["tavily_calls"] == summary["tavily_known_credits"] == "1"
+    assert summary["knowledge_observations"] == str(max_calls)
+    response = json.loads((tmp_path / "responses.jsonl").read_text())
+    assert response["model_name"] == "tavily-search"
+    assert source_url in response["model_output"]
+    assert "javascript:" not in response["model_output"]
+
+
+def test_tavily_redirect_is_a_failed_assignment_and_does_not_call_judge(tmp_path, monkeypatch):
+    llm_calls = configure_api_run(tmp_path, monkeypatch, ["--web-search", "--prompt", "Find Python docs."])
+    monkeypatch.setenv("TAVILY_API_KEY", "search-key")
+    search_urls = []
+
+    def respond(request):
+        search_urls.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "https://unexpected.example/"})
+
+    monkeypatch.setattr(
+        tavily_search, "HTTPClient", lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    with pytest.raises(SystemExit) as error:
+        run_buffered_simulation.main()
+
+    assert error.value.code == 1
+    assert search_urls == ["https://api.tavily.com/search"]
+    assert not llm_calls
+    task, = read_rows(tmp_path / "task_records.csv")
+    assert task["execution_failed"] == "True"
+    assert task["deadline_hit"] == "0"

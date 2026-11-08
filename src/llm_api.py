@@ -170,6 +170,15 @@ class LLMAPIClient:
         self.max_tokens_per_model = max_tokens_per_model or {}
         self.timeout = timeout
 
+    def reserve_call(self) -> None:
+        """Count an outgoing request against the budget shared by workers and judge."""
+        if self.max_calls is not None and self.calls_made >= self.max_calls:
+            raise BudgetExceeded(
+                f"API call budget of {self.max_calls} requests is exhausted "
+                "(raise it with max_calls or LLM_MAX_CALLS)."
+            )
+        self.calls_made += 1
+
     def call(self, model_name: str, prompt: str, task_type: str) -> Dict[str, Any]:
         """
         Send a chat completion request. Returns:
@@ -186,11 +195,6 @@ class LLMAPIClient:
             )
 
         validate_endpoint(base_url, self.allowed_hosts)
-        if self.max_calls is not None and self.calls_made >= self.max_calls:
-            raise BudgetExceeded(
-                f"API call budget of {self.max_calls} requests is exhausted "
-                "(raise it with max_calls or LLM_MAX_CALLS)."
-            )
         remote_model = self.model_aliases.get(model_name, model_name)
         with HTTPClient(
             follow_redirects=False,
@@ -212,7 +216,7 @@ class LLMAPIClient:
                 ("system", "You are a helpful assistant. Respond in plain text only. Do not call any functions or tools."),
                 ("human", prompt),
             ]
-            self.calls_made += 1
+            self.reserve_call()
             t0 = time.perf_counter()
             try:
                 with tracing_context(enabled=False):

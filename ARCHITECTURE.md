@@ -4,7 +4,7 @@
 
 1. A stateless classifier produces the task type and semantic features.
 2. LVP-style load balancing selects exactly one responsible controller.
-3. That controller evaluates every task--agent pair and publishes an immutable
+3. That controller evaluates every eligible task--agent pair and publishes an immutable
    base score and predicted processing/quality/waiting values.
 4. The global buffer refreshes only time and availability values.
 5. At every arrival or completion event, the buffer matches distinct pending
@@ -83,7 +83,7 @@ is most suitable for it.
 ## Matching invariants
 
 - A task has one responsible controller.
-- The controller publishes one unique proposal for every agent.
+- The controller publishes one unique proposal for every eligible agent.
 - A task is assigned to at most one agent.
 - A free agent is assigned at most one task per dispatch round.
 - Alternatives are retained for audit but marked `INVALIDATED` after dispatch.

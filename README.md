@@ -153,6 +153,32 @@ and output tokens, keyed by provider model ID). When any call lacks
 usage or a price, the total is left blank and the summary reports the
 known subtotal and number of unpriced calls.
 
+#### Optional Tavily web search
+
+Set `TAVILY_API_KEY` in the environment to add a separate search worker in
+API mode. Tasks tagged with `--web-search` use that worker. The controller
+and global buffer still handle assignment, and the configured judge scores
+the answer and source excerpts. The search worker is separate from the
+LLM agents counted by `--agents`.
+
+With the API configuration above in place:
+
+```bash
+export TAVILY_API_KEY="tvly-..."
+LLM_MAX_CALLS=2 python -m src.run_buffered_simulation --mode api --agents 2 \
+       --web-search --prompt "Find the official Python documentation for asyncio.TaskGroup."
+```
+
+Ordinary prompts and simulation send no requests to Tavily. A search
+request without a key exits with a configuration error. Search calls share
+the run's API budget with models and the judge. The report records Tavily
+credits separately from LLM tokens and estimated USD costs. If you use a
+knowledge database, search feedback is recorded as `WEB_SEARCH` and can
+use the same database as your existing LLM pool.
+
+See the [Tavily Search API documentation](https://docs.tavily.com/documentation/api-reference/endpoint/search)
+for the request and credit usage fields.
+
 #### Routing experience and MVP warm-up
 
 Pass `--knowledge-db` to keep routing experience in SQLite across runs.
