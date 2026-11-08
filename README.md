@@ -135,11 +135,23 @@ LLM_MAX_CALLS=10 python -m src.run_buffered_simulation --mode api --agents 2 \
        --prompt "Explain optimistic locking in two sentences."
 ```
 
-Both modes write task, event, feedback, and summary tables. API mode saves the
-model answers in `task_records.csv`. A failed agent call is recorded as an
-execution failure. A judge failure stops the API run with an error. For
-generated workloads the scheduler still uses the configured arrival times,
-with actual API latency for model execution.
+Both modes write task, event, feedback, and summary tables. In API mode,
+model answers go into `responses.jsonl`, keyed by task ID. A failed agent
+call never counts as a deadline hit. Agent failures give a nonzero exit
+code, and a judge or budget error stops the run. The summary records
+`run_status` (`running`, `completed`, `partial` or `failed`). Failed runs
+replace the previous reports and retain any results already collected.
+
+API latency measures elapsed time from task submission to evaluation,
+including the judge. The scheduler still uses a virtual clock and sends
+API requests sequentially. Virtual times are labelled `scheduler_*` in
+the API tables.
+
+API cost estimates include the agent and judge. They use the token counts
+returned by the provider and `LLM_TOKEN_PRICES` (USD per million input
+and output tokens, keyed by provider model ID). When any call lacks
+usage or a price, the total is left blank and the summary reports the
+known subtotal and number of unpriced calls.
 
 ### Legacy comparison scripts
 

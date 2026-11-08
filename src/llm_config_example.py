@@ -13,6 +13,13 @@ LLM_MODEL_ALIASES = {
 }
 LLM_ENDPOINTS = dict.fromkeys(LLM_MODEL_ALIASES, BASE_URL)
 
+# Groq standard rates in USD per million input/output tokens.
+# https://console.groq.com/docs/models
+LLM_TOKEN_PRICES = {
+    "openai/gpt-oss-20b": (0.075, 0.30),
+    "openai/gpt-oss-120b": (0.15, 0.60),
+}
+
 # Groq uses GROQ_API_KEY. For other providers set LLM_API_KEY_<INTERNAL_NAME>
 # (upper-case, with punctuation replaced by underscores), or populate
 # LLM_API_KEYS from a provider-specific environment variable using os.getenv.

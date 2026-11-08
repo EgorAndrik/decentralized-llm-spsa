@@ -1,5 +1,6 @@
 import importlib
 import logging
+import math
 import os
 import re
 import time
@@ -124,6 +125,8 @@ class LLMAPIClient:
     max_calls : int, optional
         Hard cap on the number of requests sent; the next call raises
         BudgetExceeded.  Defaults to LLM_MAX_CALLS if set, else no cap.
+    token_prices : {remote_model_id: (input_rate, output_rate)}, optional
+        USD per million tokens. Missing prices or usage leave cost unknown.
     """
 
     def __init__(
@@ -136,6 +139,7 @@ class LLMAPIClient:
         timeout: int = 60,
         allowed_hosts=None,
         max_calls: Optional[int] = None,
+        token_prices: Optional[Dict[str, Tuple[float, float]]] = None,
     ):
         hosts = set(DEFAULT_ALLOWED_HOSTS) | {h.strip().lower() for h in (allowed_hosts or ()) if h.strip()}
         hosts |= {h.strip().lower() for h in os.environ.get("LLM_ALLOWED_HOSTS", "").split(",") if h.strip()}
@@ -152,6 +156,16 @@ class LLMAPIClient:
         self.endpoints = endpoints
         self.api_keys = api_keys
         self.model_aliases = model_aliases or {}
+        # Prices are USD per million input and output tokens, keyed by provider model ID.
+        self.token_prices = {}
+        for model_id, rates in (token_prices or {}).items():
+            try:
+                input_rate, output_rate = map(float, rates)
+                if any(not math.isfinite(rate) or rate < 0 for rate in (input_rate, output_rate)):
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid token prices for {model_id!r}: expected two non-negative rates") from None
+            self.token_prices[model_id] = (input_rate, output_rate)
         self.max_tokens = max_tokens
         self.max_tokens_per_model = max_tokens_per_model or {}
         self.timeout = timeout
@@ -159,7 +173,7 @@ class LLMAPIClient:
     def call(self, model_name: str, prompt: str, task_type: str) -> Dict[str, Any]:
         """
         Send a chat completion request. Returns:
-            {"output": str, "success": bool, "latency": float}
+        Text, latency, model ID and optional usage and estimated USD cost.
         Raises ValueError if the model is not configured.
         Provider HTTP failures propagate as SDK errors.
         """
@@ -177,12 +191,13 @@ class LLMAPIClient:
                 f"API call budget of {self.max_calls} requests is exhausted "
                 "(raise it with max_calls or LLM_MAX_CALLS)."
             )
+        remote_model = self.model_aliases.get(model_name, model_name)
         with HTTPClient(
             follow_redirects=False,
             event_hooks={"response": [_validate_chat_response]},
         ) as http_client:
             model = ChatOpenAI(
-                model=self.model_aliases.get(model_name, model_name),
+                model=remote_model,
                 base_url=base_url.rstrip("/"),
                 api_key=api_key,
                 timeout=self.timeout,
@@ -211,8 +226,19 @@ class LLMAPIClient:
         content = response.content
         if not isinstance(content, str):
             raise LLMResponseError(f"{model_name}: completion content is not text")
+        usage = response.response_metadata.get("token_usage") or {}
+        input_tokens = usage.get("prompt_tokens")
+        output_tokens = usage.get("completion_tokens")
+        rates = self.token_prices.get(remote_model)
+        cost = None
+        if rates is not None and input_tokens is not None and output_tokens is not None:
+            cost = (input_tokens * rates[0] + output_tokens * rates[1]) / 1_000_000
         return {
             "output": content,
             "success": True,
             "latency": latency,
+            "model_name": response.response_metadata.get("model_name") or remote_model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": cost,
         }

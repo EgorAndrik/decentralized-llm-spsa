@@ -613,6 +613,7 @@ class JudgeFallback:
         self.llm_api_client = llm_api_client
         self.judge_model_name = judge_model_name
         self.adaptive_feedback = adaptive_feedback
+        self.last_api_usage = None
         # Сколько оценок пришло от LLM-судьи, а сколько заменено эвристикой.
         self.judge_stats = {"llm_ok": 0, "parse_failed": 0, "api_failed": 0}
         self.alpha = np.ones((len(profiles), 5))
@@ -718,6 +719,12 @@ class JudgeFallback:
             f"</untrusted-{tag}>\n"
         )
         api_result = self.llm_api_client.call(self.judge_model_name, prompt, "JUDGE")
+        self.last_api_usage = {
+            "model_name": api_result.get("model_name", self.judge_model_name),
+            "input_tokens": api_result.get("input_tokens"),
+            "output_tokens": api_result.get("output_tokens"),
+            "cost_usd": api_result.get("cost_usd"),
+        }
         return self._parse_judge_output(api_result.get("output"))
 
     def evaluate(
@@ -730,6 +737,7 @@ class JudgeFallback:
         synthetic_quality: Optional[Dict[str, float]]=None,
         allow_heuristic_fallback: bool=True,
     ) -> Dict[str, float]:
+        self.last_api_usage = None
         t_idx = subtask.type.value
         expected_time = self.profiles[agent_id].tau_avg[t_idx] * (1.0 + subtask.h_Ti / 10.0)
         T_i = float(np.exp(-max(0.0, latency - expected_time) / max(expected_time, 1e-6)))

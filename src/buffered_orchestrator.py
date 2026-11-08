@@ -6,6 +6,7 @@ import heapq
 import itertools
 import logging
 import math
+import time
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence
 
@@ -42,6 +43,7 @@ class BufferedPayload:
     routed_task: Task
     predicted_time: float
     predicted_wait: float
+    wall_arrived: Optional[float] = None
 
 
 @dataclass(order=True)
@@ -99,6 +101,9 @@ class BufferedOrchestrator(ExactOrchestrator):
         self.completion_events: List[CompletionEvent] = []
         self.event_records: List[dict] = []
         self.feedback_records: List[dict] = []
+        self.response_records: List[dict] = []
+        self._api_costs: List[Optional[float]] = []
+        self._api_clock_start: Optional[float] = None
         self.controller_assignment_counts = {ctrl.id: 0 for ctrl in self.controllers}
         self._completion_sequence = itertools.count()
         self._completed_updates = 0
@@ -140,6 +145,12 @@ class BufferedOrchestrator(ExactOrchestrator):
 
     def submit_task(self, task: Task) -> int:
         """Classify, load-balance, score every task--agent pair, and buffer it."""
+        wall_arrived = None
+        if self.llm_api_client is not None:
+            now = time.perf_counter()
+            if self._api_clock_start is None:
+                self._api_clock_start = now
+            wall_arrived = now - self._api_clock_start
         self.time = float(task.t_arrival)
         predicted_type = self.classifier.predict(task)
         self.metrics["type_cls_acc"].append(
@@ -219,7 +230,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             deadline=deadline,
             time_budget=budget,
             proposals=proposals,
-            payload=BufferedPayload(task, routed_task, float(p_hat), float(w_hat)),
+            payload=BufferedPayload(task, routed_task, float(p_hat), float(w_hat), wall_arrived),
         )
         self.event_records.append(
             {
@@ -245,10 +256,16 @@ class BufferedOrchestrator(ExactOrchestrator):
         payload: BufferedPayload = assignment.payload
         task = payload.task
         agent = self.agents[assignment.agent_id]
-        profile = PROFILES[agent.id]
         self.metrics["assignments"] += 1
 
         result = self._execute_assignment(assignment, payload)
+        if self.llm_api_client is not None and not result["execution_failed"]:
+            self.response_records.append({
+                "task_id": task.id,
+                "agent_id": agent.id,
+                "model_name": result["model_name"],
+                "model_output": result["model_output"],
+            })
         self._enqueue_agent_task(
             agent,
             task,
@@ -301,64 +318,44 @@ class BufferedOrchestrator(ExactOrchestrator):
         prompt = task.text or (
             f"{task.type.name}: complexity={task.h_Ti:.2f}, urgency={task.urgency:.2f}"
         )
-        called = False
+        started = time.perf_counter()
+        requested_model = getattr(self.llm_api_client, "model_aliases", {}).get(
+            profile.model_name, profile.model_name
+        )
         try:
             api_result = self.llm_api_client.call(profile.model_name, prompt, task.type.name)
-            called = True
-            self.api_stats["calls"] += 1
-            service_time = float(api_result.get("latency") or assignment.predicted_processing)
-            input_tokens = self._estimate_task_tokens(task)
-            output = str(api_result.get("output", ""))
-            output_tokens = max(32, int(len(output) / 4)) if output else 32
-            actual_wait = max(0.0, self.time - task.t_arrival)
-            return {
-                "success": bool(api_result.get("success", True)),
-                "service_time": service_time,
-                "actual_wait": actual_wait,
-                "agent_wait": 0.0,
-                "controller_delay": actual_wait,
-                "actual_start": self.time,
-                "finish_time": self.time + service_time,
-                "response_latency": actual_wait + service_time,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "semantic_match": self._cosine_similarity(task.phi_i, profile.psi_k),
-                "model_output": output,
-                "synthetic_quality": None,
-                "cost": MODEL_TOKEN_PRICE.get(profile.model_name, 0.5)
-                * ((input_tokens + output_tokens) / 1000.0),
-                "execution_failed": not bool(api_result.get("success", True)),
-            }
         except BudgetExceeded:
             raise  # лимит расходов должен остановить прогон, а не стать «сбоем исполнения»
         except Exception as exc:
-            if not called:
-                self.api_stats["calls"] += 1
-            self.api_stats["failed"] += 1
             logger.warning("LLM call to %s failed (%s: %s); task marked execution_failed",
-                           profile.model_name, type(exc).__name__, exc)
-            service_time = max(0.01, float(assignment.predicted_processing))
-            input_tokens = self._estimate_task_tokens(task)
-            actual_wait = max(0.0, self.time - task.t_arrival)
-            return {
-                "success": False,
-                "execution_failed": True,
-                "service_time": service_time,
-                "actual_wait": actual_wait,
-                "agent_wait": 0.0,
-                "controller_delay": actual_wait,
-                "actual_start": self.time,
-                "finish_time": self.time + service_time,
-                "response_latency": actual_wait + service_time,
-                "input_tokens": input_tokens,
-                "output_tokens": 0,
-                "semantic_match": self._cosine_similarity(task.phi_i, profile.psi_k),
-                "model_output": "",
-                "synthetic_quality": None,
-                "cost": MODEL_TOKEN_PRICE.get(profile.model_name, 0.5)
-                * (input_tokens / 1000.0),
-                "api_fallback": 1,
-            }
+                           requested_model, type(exc).__name__, exc)
+            api_result = {"success": False}
+        finished = time.perf_counter()
+        success = bool(api_result.get("success", True))
+        self.api_stats["calls"] += 1
+        self.api_stats["failed"] += int(not success)
+        cost = api_result.get("cost_usd")
+        self._api_costs.append(cost)
+        service_time = float(api_result.get("latency") or (finished - started))
+        actual_wait = max(0.0, self.time - task.t_arrival)
+        return {
+            "success": success,
+            "execution_failed": not success,
+            "service_time": service_time,
+            "actual_wait": actual_wait,
+            "actual_start": self.time,
+            "finish_time": self.time + service_time,
+            "response_latency": actual_wait + service_time,
+            "input_tokens": api_result.get("input_tokens"),
+            "output_tokens": api_result.get("output_tokens"),
+            "model_name": api_result.get("model_name", requested_model),
+            "model_output": str(api_result.get("output", "")),
+            "semantic_match": self._cosine_similarity(task.phi_i, profile.psi_k),
+            "synthetic_quality": None,
+            "cost": cost,
+            "wall_worker_started": started - self._api_clock_start,
+            "wall_worker_finished": finished - self._api_clock_start,
+        }
 
     def _quantize_synthetic_duration(self, result: dict) -> None:
         """Optionally express numerical experiments in discrete time ticks."""
@@ -383,29 +380,87 @@ class BufferedOrchestrator(ExactOrchestrator):
         selected_candidate = buffered.proposals[agent.id].proposal
 
         execution_failed = bool(result.get("execution_failed", False))
+        api_mode = self.llm_api_client is not None
+        judge_usage = None
+        judge_attempted = False
+        judge_latency = None
         if self.strict_judge and execution_failed:
             # A failed API call leaves no answer for the judge to evaluate.
             verdict = {"Q": 0.0, "success": False}
         else:
-            verdict = self.judge.evaluate(
-                agent.id,
-                task,
-                base_success=1.0 if result["success"] else 0.0,
-                latency=float(result["response_latency"]),
-                model_output=str(result["model_output"]),
-                synthetic_quality=result.get("synthetic_quality") if self.variant.use_judge else None,
-                allow_heuristic_fallback=not self.strict_judge,
-            )
+            judge_started = time.perf_counter() if api_mode else None
+            previous_failures = self.judge.judge_stats["api_failed"]
+            try:
+                verdict = self.judge.evaluate(
+                    agent.id,
+                    task,
+                    base_success=1.0 if result["success"] else 0.0,
+                    latency=float(result["response_latency"]),
+                    model_output=str(result["model_output"]),
+                    synthetic_quality=result.get("synthetic_quality") if self.variant.use_judge else None,
+                    allow_heuristic_fallback=not self.strict_judge,
+                )
+            finally:
+                judge_usage = self.judge.last_api_usage
+                judge_attempted = judge_usage is not None or self.judge.judge_stats["api_failed"] > previous_failures
+                if api_mode and judge_attempted:
+                    judge_latency = time.perf_counter() - judge_started
+                    self._api_costs.append((judge_usage or {}).get("cost_usd"))
         quality = float(verdict["Q"])
         success = bool(verdict["success"]) and not execution_failed
-        deadline_hit = 1.0 if event.finish_time <= buffered.deadline else 0.0
+        latency = float(result["response_latency"])
+        actual_wait = float(result["actual_wait"])
+        deadline_hit = float(not execution_failed and event.finish_time <= buffered.deadline)
+        cost = result["cost"]
+        api_record = {}
+        timing = {
+            "buffered_at": float(task.t_arrival),
+            "assigned_at": float(assignment.dispatch_time),
+            "deadline": float(buffered.deadline),
+            "actual_start": float(result["actual_start"]),
+            "finish_time": float(event.finish_time),
+            "service_time": float(result["service_time"]),
+        }
+        if api_mode:
+            wall_finished = time.perf_counter() - self._api_clock_start
+            latency = wall_finished - payload.wall_arrived
+            actual_wait = result["wall_worker_started"] - payload.wall_arrived
+            wall_deadline = payload.wall_arrived + buffered.time_budget
+            judge_usage = judge_usage or {}
+            judge_cost = judge_usage.get("cost_usd")
+            if judge_attempted:
+                cost = cost + judge_cost if cost is not None and judge_cost is not None else None
+            api_record = {
+                "execution_failed": execution_failed,
+                "input_tokens": result["input_tokens"],
+                "output_tokens": result["output_tokens"],
+                "worker_cost_usd": result["cost"],
+                "worker_finished_at": result["wall_worker_finished"],
+                "judge_model_name": judge_usage.get("model_name"),
+                "judge_input_tokens": judge_usage.get("input_tokens"),
+                "judge_output_tokens": judge_usage.get("output_tokens"),
+                "judge_cost_usd": judge_cost,
+                "judge_latency": judge_latency,
+                **{f"scheduler_{key}": value for key, value in timing.items()},
+                "scheduler_latency": result["response_latency"],
+                "scheduler_deadline_hit": deadline_hit,
+            }
+            timing = {
+                "buffered_at": payload.wall_arrived,
+                "assigned_at": result["wall_worker_started"],
+                "deadline": wall_deadline,
+                "actual_start": result["wall_worker_started"],
+                "finish_time": wall_finished,
+                "service_time": result["wall_worker_finished"] - result["wall_worker_started"],
+            }
+            deadline_hit = float(not execution_failed and wall_finished <= wall_deadline)
         utility = self._compute_observed_utility(
             q_true=quality,
             success=success,
             deadline_hit=deadline_hit,
-            latency=float(result["response_latency"]),
-            true_wait=float(result["actual_wait"]),
-            cost=float(result["cost"]),
+            latency=latency,
+            true_wait=actual_wait,
+            cost=cost if cost is not None else 0.0,
             semantic_match=float(result["semantic_match"]),
             urgency=float(task.urgency),
             predicted_wait=payload.predicted_wait,
@@ -432,7 +487,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             controller.rls_update(
                 payload.routed_task.type.value,
                 float(result["service_time"]),
-                float(result["actual_wait"]),
+                actual_wait,
                 task.phi_i,
             )
             controller.adapt_routing_weights(
@@ -448,22 +503,23 @@ class BufferedOrchestrator(ExactOrchestrator):
                 raw_w_hat=payload.predicted_wait,
                 raw_q_hat=selected_candidate.predicted_quality,
                 service_time=float(result["service_time"]),
-                true_wait=float(result["actual_wait"]),
+                true_wait=actual_wait,
                 true_q=quality,
                 urgency=float(task.urgency),
                 deadline_hit=deadline_hit,
                 predicted_wait=payload.predicted_wait,
                 predicted_budget=buffered.time_budget,
-                latency=float(result["response_latency"]),
+                latency=latency,
             )
 
         self.buffer.complete(task.id, event.finish_time, success=success)
         self._refresh_agent_runtime(agent, event.finish_time)
         self.metrics["success_rate"].append(1.0 if success else 0.0)
         self.metrics["judge_quality"].append(quality)
-        self.metrics["latency"].append(float(result["response_latency"]))
+        self.metrics["latency"].append(latency)
         self.metrics["deadline_hits"].append(deadline_hit)
-        self.metrics["costs"].append(float(result["cost"]))
+        if cost is not None:
+            self.metrics["costs"].append(cost)
         self.metrics["weighted_success"].append(
             (1.0 if success else 0.0) * (1.0 + task.urgency)
         )
@@ -497,9 +553,6 @@ class BufferedOrchestrator(ExactOrchestrator):
                 "utility": utility,
             }
         )
-        api_record = {}
-        if self.llm_api_client is not None:
-            api_record = {"model_output": result["model_output"], "execution_failed": execution_failed}
         self._record_task(
             variant=self.variant.name,
             parent_id=task.id,
@@ -510,18 +563,12 @@ class BufferedOrchestrator(ExactOrchestrator):
             controller_id=controller.id,
             assigned=1,
             agent_id=agent.id,
-            model_name=profile.model_name,
-            buffered_at=float(task.t_arrival),
-            assigned_at=float(assignment.dispatch_time),
+            model_name=result.get("model_name", profile.model_name),
             predicted_time=float(assignment.predicted_processing),
             predicted_wait=float(payload.predicted_wait),
-            deadline=float(buffered.deadline),
-            latency=float(result["response_latency"]),
-            true_wait=float(result["actual_wait"]),
-            actual_start=float(result["actual_start"]),
-            finish_time=float(event.finish_time),
-            service_time=float(result["service_time"]),
-            cost=float(result["cost"]),
+            latency=latency,
+            true_wait=actual_wait,
+            cost=cost,
             q_hat=float(selected_candidate.predicted_quality),
             q_true=quality,
             success=int(success),
@@ -530,6 +577,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             buffer_priority=float(assignment.priority),
             slack_coefficient=float(assignment.slack_coefficient),
             routing_utility=utility,
+            **timing,
             **api_record,
         )
         self.event_records.append(
@@ -614,8 +662,30 @@ class BufferedOrchestrator(ExactOrchestrator):
                 float(sum(1 for _ in self.buffer.pending_tasks()))
             )
 
-        self.time = max((record.get("finish_time", 0.0) for record in self.task_records), default=self.time)
+        self.time = max(
+            (record.get("scheduler_finish_time", record["finish_time"]) for record in self.task_records),
+            default=self.time,
+        )
         return self.collect_summary()
+
+    def collect_summary(self):
+        summary = super().collect_summary()
+        if self.llm_api_client is not None:
+            unknown = self._api_costs.count(None)
+            known_cost = sum(cost for cost in self._api_costs if cost is not None)
+            attempts = self.api_stats["calls"]
+            success_count = sum(self.metrics["success_rate"])
+            summary.update(
+                total_cost=None if unknown else known_cost,
+                mean_cost_per_task=known_cost / attempts if not unknown and attempts else None,
+                cost_per_success=known_cost / success_count if not unknown and success_count else None,
+                known_api_cost_usd=known_cost,
+                unpriced_api_calls=unknown,
+                scheduler_deadline_hit_rate=self._safe_mean(
+                    [row["scheduler_deadline_hit"] for row in self.task_records]
+                ),
+            )
+        return summary
 
     def generate_batched_stream(
         self,
