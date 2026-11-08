@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import sqlite3
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +16,7 @@ import pandas as pd
 from .buffered_orchestrator import BufferedOrchestrator
 from .llm_api import BudgetExceeded, LLMAPIClient, api_key_from_env, import_config_module
 from .main import PROFILES, JudgeEvaluationError, SemanticFeatureExtractor, SimulationVariant, Task
+from .routing_knowledge import RoutingKnowledge
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -20,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("simulation", "api"), default="simulation")
     parser.add_argument("--config", default="llm_config", help="API config module (llm_config*).")
     parser.add_argument("--prompt", help="Run one user prompt in API mode instead of the generated workload.")
+    parser.add_argument("--knowledge-db", type=Path, help="Persist routing experience in this SQLite file.")
+    parser.add_argument("--round-size", type=int, help="Evaluated tasks per knowledge round (default: 5).")
+    parser.add_argument("--mvp-rounds", type=int, help="Completed rounds before serving prompts (default: 3).")
     parser.add_argument("--tasks", type=int, help="Generated task count (simulation: 200, API: 1 by default).")
     parser.add_argument("--controllers", type=int, default=3)
     parser.add_argument("--agents", type=int, default=5)
@@ -81,11 +88,26 @@ def main() -> None:
     args = parser.parse_args()
     if not 1 <= args.agents <= len(PROFILES):
         parser.error(f"--agents must be between 1 and {len(PROFILES)}")
+    if args.controllers < 1:
+        parser.error("--controllers must be positive")
     if args.prompt is not None and (args.mode != "api" or not args.prompt.strip()):
         parser.error("--prompt requires API mode and a non-empty prompt")
     if args.tasks is not None and args.tasks < 1:
         parser.error("--tasks must be positive")
+    if args.knowledge_db is None and (args.round_size is not None or args.mvp_rounds is not None):
+        parser.error("--round-size and --mvp-rounds require --knowledge-db")
+    if args.knowledge_db is not None:
+        report_names = ("summary.csv", "task_records.csv", "event_records.csv", "feedback_records.csv", "responses.jsonl")
+        if any(args.knowledge_db.resolve() == (args.output_dir / name).resolve() for name in report_names):
+            parser.error("--knowledge-db must point to a separate file from the run reports")
+    if args.prompt is not None and args.knowledge_db is not None and not args.knowledge_db.is_file():
+        parser.error("The knowledge database does not exist. Run the warm-up tasks first.")
 
+    with ExitStack() as resources:
+        run_configured(args, parser, resources)
+
+
+def run_configured(args: argparse.Namespace, parser: argparse.ArgumentParser, resources: ExitStack) -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([{"mode": args.mode, "run_status": "running"}]).to_csv(
         args.output_dir / "summary.csv", index=False
@@ -98,6 +120,33 @@ def main() -> None:
             write_reports(args.output_dir, None, {"mode": args.mode, "run_status": "failed"}, args.mode)
             parser.error(f"API configuration: {exc}")
         api_options = dict(llm_api_client=client, judge_model_name=judge_model, strict_judge=True)
+
+    knowledge = None
+    if args.knowledge_db is not None:
+        agent_names = [profile.model_name for profile in PROFILES[:args.agents]]
+        scope = {"mode": args.mode, "controllers": args.controllers, "agents": agent_names}
+        if args.mode == "api":
+            # Bind experience to the configured provider and model, without storing URLs or keys.
+            scope["api_models"] = {
+                name: {
+                    "model": client.model_aliases.get(name, name),
+                    "endpoint_hash": hashlib.sha256(client.endpoints[name].rstrip("/").encode()).hexdigest(),
+                }
+                for name in agent_names + [judge_model]
+            }
+            scope["judge"] = judge_model
+        try:
+            knowledge = RoutingKnowledge(
+                args.knowledge_db, scope, round_size=args.round_size, mvp_rounds=args.mvp_rounds,
+            )
+            resources.callback(knowledge.close)
+            if args.prompt is not None and not knowledge.ready:
+                raise ValueError(
+                    f"MVP warm-up incomplete: {knowledge.completed_rounds}/{knowledge.mvp_rounds} rounds."
+                )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            write_reports(args.output_dir, None, {"mode": args.mode, "run_status": "failed"}, args.mode)
+            parser.error(f"Knowledge database: {exc}")
 
     np.random.seed(args.seed)
     variant = SimulationVariant(
@@ -114,6 +163,7 @@ def main() -> None:
         variant=variant,
         simulation_tick=args.tick_duration if args.mode == "simulation" else None,
         classifier_seed=args.seed,
+        knowledge=knowledge,
         **api_options,
     )
     if args.prompt is None:
@@ -137,7 +187,7 @@ def main() -> None:
     started = time.perf_counter()
     try:
         summary = orchestrator.run(tasks)
-    except (BudgetExceeded, JudgeEvaluationError) as exc:
+    except (BudgetExceeded, JudgeEvaluationError, sqlite3.Error) as exc:
         summary = orchestrator.collect_summary()
         error = str(exc)
     summary.update(mode=args.mode, run_status="failed" if error is not None else "completed")

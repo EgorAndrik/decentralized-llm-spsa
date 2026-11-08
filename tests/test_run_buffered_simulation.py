@@ -122,7 +122,10 @@ def test_judge_failure_replaces_stale_reports_and_keeps_paid_answer(tmp_path, mo
 
 
 def test_failed_worker_calls_miss_deadlines_and_return_error(tmp_path, monkeypatch):
-    calls = configure_api_run(tmp_path, monkeypatch, ["--tasks", "2"], worker_fails=True)
+    db = tmp_path / "knowledge.sqlite3"
+    calls = configure_api_run(
+        tmp_path, monkeypatch, ["--tasks", "2", "--knowledge-db", str(db)], worker_fails=True,
+    )
 
     with pytest.raises(SystemExit) as error:
         run_buffered_simulation.main()
@@ -136,4 +139,40 @@ def test_failed_worker_calls_miss_deadlines_and_return_error(tmp_path, monkeypat
     assert float(summary["scheduler_deadline_hit_rate"]) == 0.0
     assert int(summary["unpriced_api_calls"]) == 2
     assert summary["total_cost"] == ""
+    assert summary["knowledge_observations"] == "0"
     assert not (tmp_path / "responses.jsonl").read_text()
+
+
+def test_mvp_prompt_requires_completed_rounds_from_persistent_knowledge(tmp_path, monkeypatch, capsys):
+    db_args = ["--knowledge-db", str(tmp_path / "knowledge.sqlite3")]
+    verdict = '{"quality_score": 0.95}'
+    configure_api_run(
+        tmp_path, monkeypatch, [*db_args, "--round-size", "2", "--mvp-rounds", "1", "--tasks", "1"],
+        judge_output=verdict,
+    )
+    run_buffered_simulation.main()
+    assert read_rows(tmp_path / "summary.csv")[0]["mvp_ready"] == "False"
+
+    calls = configure_api_run(
+        tmp_path, monkeypatch, [*db_args, "--prompt", "Explain SQL."], judge_output=verdict,
+    )
+    with pytest.raises(SystemExit) as error:
+        run_buffered_simulation.main()
+    assert error.value.code == 2
+    assert "0/1 rounds" in capsys.readouterr().err
+    assert not calls
+
+    configure_api_run(tmp_path, monkeypatch, [*db_args, "--tasks", "1"], judge_output=verdict)
+    run_buffered_simulation.main()
+    summary, = read_rows(tmp_path / "summary.csv")
+    assert summary["mvp_ready"] == "True"
+    assert summary["knowledge_rounds"] == "1"
+    assert any(row["event"] == "knowledge_round" for row in read_rows(tmp_path / "event_records.csv"))
+    capsys.readouterr()
+
+    calls = configure_api_run(
+        tmp_path, monkeypatch, [*db_args, "--prompt", "Explain SQL."], judge_output=verdict,
+    )
+    run_buffered_simulation.main()
+    assert capsys.readouterr().out.strip() == "=1+1"
+    assert len(calls) == 2

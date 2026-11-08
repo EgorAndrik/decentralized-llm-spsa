@@ -153,6 +153,37 @@ and output tokens, keyed by provider model ID). When any call lacks
 usage or a price, the total is left blank and the summary reports the
 known subtotal and number of unpriced calls.
 
+#### Routing experience and MVP warm-up
+
+Pass `--knowledge-db` to keep routing experience in SQLite across runs.
+Each controller records the count, outcome, judge score and execution time
+by task type and agent. Every `--round-size` evaluated tasks publish a shared
+snapshot across controllers. The router uses local estimates when available
+and the shared snapshot for pairs it has not seen. API failures without a
+judge score do not advance the round. No prompts or answers go into this database.
+
+For example, collect three rounds of five tasks on the generated workload:
+
+```bash
+LLM_MAX_CALLS=30 python -m src.run_buffered_simulation --mode api --agents 2 \
+       --knowledge-db buffered_outputs/routing_knowledge.sqlite3 \
+       --round-size 5 --mvp-rounds 3 --tasks 15
+```
+
+After the summary shows `mvp_ready=True`, use the same database to route a
+user prompt:
+
+```bash
+python -m src.run_buffered_simulation --mode api --agents 2 \
+       --knowledge-db buffered_outputs/routing_knowledge.sqlite3 \
+       --prompt "Explain optimistic locking in two sentences."
+```
+
+The database keeps incomplete rounds, so another batch can finish the
+warm-up. Use a separate database for simulation or a different model pool.
+Knowledge rounds publish routing statistics and are separate from the
+existing A-SPSA parameter synchronization rounds.
+
 ### Legacy comparison scripts
 
 These use the legacy loss and optimizer path described above and are retained

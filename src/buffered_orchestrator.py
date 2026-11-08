@@ -31,6 +31,7 @@ from .main import (
     rank_agents,
 )
 from .llm_api import BudgetExceeded
+from .routing_knowledge import RoutingKnowledge
 from .spsa_variants import call_variant
 
 
@@ -72,6 +73,7 @@ class BufferedOrchestrator(ExactOrchestrator):
         simulation_tick: Optional[float] = None,
         classifier_seed: int = 42,
         strict_judge: bool = False,
+        knowledge: RoutingKnowledge | None = None,
     ) -> None:
         variant = variant or SimulationVariant(
             name="global_buffer_aspsa",
@@ -98,6 +100,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             raise ValueError("simulation_tick must be positive or None")
         self.simulation_tick = simulation_tick
         self.strict_judge = strict_judge
+        self.knowledge = knowledge
         self.completion_events: List[CompletionEvent] = []
         self.event_records: List[dict] = []
         self.feedback_records: List[dict] = []
@@ -202,6 +205,15 @@ class BufferedOrchestrator(ExactOrchestrator):
         proposals = []
         for candidate in candidates:
             features = np.asarray(candidate["routing_features"], dtype=float).copy()
+            predicted_processing = float(candidate["theor_time"])
+            predicted_quality = float(candidate["predicted_quality"])
+            if self.knowledge is not None:
+                predicted_quality, predicted_processing = self.knowledge.estimate(
+                    controller_id, routed_task.type.name, int(candidate["agent_id"]),
+                    predicted_quality, predicted_processing,
+                )
+                features[2] = predicted_quality
+                features[3] = np.exp(-predicted_processing / max(p_hat + 0.5, 0.5))
             # Availability and queue state are owned by the buffer.  Urgency is
             # represented by the raw task urgency; dynamic hotness is added later.
             features[1] = 0.0
@@ -212,8 +224,8 @@ class BufferedOrchestrator(ExactOrchestrator):
                 CandidateProposal(
                     agent_id=int(candidate["agent_id"]),
                     base_score=base_score,
-                    predicted_processing=float(candidate["theor_time"]),
-                    predicted_quality=float(candidate["predicted_quality"]),
+                    predicted_processing=predicted_processing,
+                    predicted_quality=predicted_quality,
                     relevance=float(candidate["relevance"]),
                     cost=float(candidate["task_price"]),
                     feature_vector=tuple(float(x) for x in features),
@@ -384,6 +396,7 @@ class BufferedOrchestrator(ExactOrchestrator):
         judge_usage = None
         judge_attempted = False
         judge_latency = None
+        previous_evaluations = self.judge.judge_stats["llm_ok"]
         if self.strict_judge and execution_failed:
             # A failed API call leaves no answer for the judge to evaluate.
             verdict = {"Q": 0.0, "success": False}
@@ -408,6 +421,17 @@ class BufferedOrchestrator(ExactOrchestrator):
                     self._api_costs.append((judge_usage or {}).get("cost_usd"))
         quality = float(verdict["Q"])
         success = bool(verdict["success"]) and not execution_failed
+        if self.knowledge is not None and not execution_failed and (
+            not api_mode or self.judge.judge_stats["llm_ok"] > previous_evaluations
+        ):
+            round_number = self.knowledge.record(
+                controller.id, payload.routed_task.type.name, agent.id,
+                success=success, quality=quality, service_seconds=float(result["service_time"]),
+            )
+            if round_number is not None:
+                self.event_records.append({
+                    "event": "knowledge_round", "time": event.finish_time, "round": round_number,
+                })
         latency = float(result["response_latency"])
         actual_wait = float(result["actual_wait"])
         deadline_hit = float(not execution_failed and event.finish_time <= buffered.deadline)
@@ -670,6 +694,15 @@ class BufferedOrchestrator(ExactOrchestrator):
 
     def collect_summary(self):
         summary = super().collect_summary()
+        if self.knowledge is not None:
+            observations = self.knowledge.observations
+            rounds = observations // self.knowledge.round_size
+            summary.update(
+                knowledge_observations=observations,
+                knowledge_rounds=rounds,
+                mvp_required_rounds=self.knowledge.mvp_rounds,
+                mvp_ready=rounds >= self.knowledge.mvp_rounds,
+            )
         if self.llm_api_client is not None:
             unknown = self._api_costs.count(None)
             known_cost = sum(cost for cost in self._api_costs if cost is not None)
