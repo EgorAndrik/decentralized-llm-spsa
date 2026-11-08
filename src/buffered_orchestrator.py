@@ -69,6 +69,7 @@ class BufferedOrchestrator(ExactOrchestrator):
         routing_learning_rate: float = 0.05,
         simulation_tick: Optional[float] = None,
         classifier_seed: int = 42,
+        strict_judge: bool = False,
     ) -> None:
         variant = variant or SimulationVariant(
             name="global_buffer_aspsa",
@@ -94,6 +95,7 @@ class BufferedOrchestrator(ExactOrchestrator):
         if simulation_tick is not None and simulation_tick <= 0.0:
             raise ValueError("simulation_tick must be positive or None")
         self.simulation_tick = simulation_tick
+        self.strict_judge = strict_judge
         self.completion_events: List[CompletionEvent] = []
         self.event_records: List[dict] = []
         self.feedback_records: List[dict] = []
@@ -380,18 +382,22 @@ class BufferedOrchestrator(ExactOrchestrator):
         buffered = self.buffer.tasks[task.id]
         selected_candidate = buffered.proposals[agent.id].proposal
 
-        verdict = self.judge.evaluate(
-            agent.id,
-            task,
-            base_success=1.0 if result["success"] else 0.0,
-            latency=float(result["response_latency"]),
-            model_output=str(result["model_output"]),
-            synthetic_quality=result.get("synthetic_quality")
-            if self.variant.use_judge
-            else None,
-        )
+        execution_failed = bool(result.get("execution_failed", False))
+        if self.strict_judge and execution_failed:
+            # A failed API call leaves no answer for the judge to evaluate.
+            verdict = {"Q": 0.0, "success": False}
+        else:
+            verdict = self.judge.evaluate(
+                agent.id,
+                task,
+                base_success=1.0 if result["success"] else 0.0,
+                latency=float(result["response_latency"]),
+                model_output=str(result["model_output"]),
+                synthetic_quality=result.get("synthetic_quality") if self.variant.use_judge else None,
+                allow_heuristic_fallback=not self.strict_judge,
+            )
         quality = float(verdict["Q"])
-        success = bool(verdict["success"]) and not bool(result.get("execution_failed", False))
+        success = bool(verdict["success"]) and not execution_failed
         deadline_hit = 1.0 if event.finish_time <= buffered.deadline else 0.0
         utility = self._compute_observed_utility(
             q_true=quality,
@@ -491,6 +497,9 @@ class BufferedOrchestrator(ExactOrchestrator):
                 "utility": utility,
             }
         )
+        api_record = {}
+        if self.llm_api_client is not None:
+            api_record = {"model_output": result["model_output"], "execution_failed": execution_failed}
         self._record_task(
             variant=self.variant.name,
             parent_id=task.id,
@@ -521,6 +530,7 @@ class BufferedOrchestrator(ExactOrchestrator):
             buffer_priority=float(assignment.priority),
             slack_coefficient=float(assignment.slack_coefficient),
             routing_utility=utility,
+            **api_record,
         )
         self.event_records.append(
             {

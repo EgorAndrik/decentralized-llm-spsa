@@ -591,6 +591,10 @@ class JudgeParseError(ValueError):
     """Ответ судьи нельзя разобрать в валидную оценку; такой ответ не должен попадать в метрики."""
 
 
+class JudgeEvaluationError(RuntimeError):
+    """The API judge could not produce an evaluation in strict mode."""
+
+
 class JudgeFallback:
     """Судья: численная обратная связь Q ∈ [0,1] для калибровки предиктора контроллера."""
 
@@ -724,6 +728,7 @@ class JudgeFallback:
         latency: float,
         model_output: str="",
         synthetic_quality: Optional[Dict[str, float]]=None,
+        allow_heuristic_fallback: bool=True,
     ) -> Dict[str, float]:
         t_idx = subtask.type.value
         expected_time = self.profiles[agent_id].tau_avg[t_idx] * (1.0 + subtask.h_Ti / 10.0)
@@ -758,6 +763,8 @@ class JudgeFallback:
                 if self.llm_api_client is not None:
                     key = "parse_failed" if isinstance(exc, JudgeParseError) else "api_failed"
                     self.judge_stats[key] += 1
+                    if not allow_heuristic_fallback:
+                        raise JudgeEvaluationError(f"API judge failed ({key}): {exc}") from exc
                     logger.warning("LLM judge failed (%s): %s; using heuristic fallback", key, exc)
                 S_i = float(np.clip(base_success, 0.0, 1.0))
                 conf = 0.4

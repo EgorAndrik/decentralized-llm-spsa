@@ -60,18 +60,30 @@ paths.** Only `src.run_paper_experiments` produces paper evidence.
 pip install -r requirements.txt
 ```
 
-### API keys (real-LLM mode only)
+### Connecting a provider (real-LLM mode only)
+
+Agents and the judge share a LangChain client for APIs that implement OpenAI
+Chat Completions. Configure the base URL (without `/chat/completions`), the
+provider's model IDs and API credentials. No provider-specific Python SDK is
+needed to add another compatible endpoint.
+
+The example config maps the first two agent profiles to Groq models. To try
+that configuration with a small API run:
 
 ```bash
 cp src/llm_config_example.py src/llm_config.py
-# edit src/llm_config.py — add your Groq / OpenRouter key
-```
-
-Or export the Groq key as an environment variable:
-
-```bash
 export GROQ_API_KEY="gsk_..."
+LLM_MAX_CALLS=10 python -m src.run_buffered_simulation --mode api --agents 2 --tasks 2
 ```
+
+For a different endpoint, update `LLM_ENDPOINTS` and `LLM_MODEL_ALIASES` in
+`src/llm_config.py`. Use `LLM_API_KEY_<INTERNAL_NAME>` for a per-model
+credential (for example, `LLM_API_KEY_LLAMA3_8B_INSTRUCT`), or populate
+`LLM_API_KEYS` from your provider's environment variable. Add a trusted
+HTTPS hostname via `LLM_ALLOWED_HOSTS` if it is not already allowed.
+For comparison runs, configure every agent profile the runner uses. The
+two-agent example reuses one worker model as the judge to demonstrate the
+connection.
 
 ## Reproducing Results
 
@@ -109,13 +121,25 @@ python -m src.audit_it_benchmark --per-skill 200 --seed 42 \
 ### Global-buffer architecture demo
 
 ```bash
-python -m src.run_buffered_simulation --tasks 200 --controllers 3 --agents 5 \
+python -m src.run_buffered_simulation --mode simulation --tasks 200 --controllers 3 --agents 5 \
        --seed 42 --output-dir buffered_outputs
 ```
 
-The runner writes task, event, feedback, and summary tables. In simulation,
-time advances to the next arrival or completion event. With real endpoints,
-the same state machine uses measured API latency.
+Simulation is the default and requires no credentials. Use `--mode api` with
+the provider config above to run the same scheduler with real model calls for
+both agents and the judge. API mode defaults to one generated task. To send
+your own task and print the chosen model's answer:
+
+```bash
+LLM_MAX_CALLS=10 python -m src.run_buffered_simulation --mode api --agents 2 \
+       --prompt "Explain optimistic locking in two sentences."
+```
+
+Both modes write task, event, feedback, and summary tables. API mode saves the
+model answers in `task_records.csv`. A failed agent call is recorded as an
+execution failure. A judge failure stops the API run with an error. For
+generated workloads the scheduler still uses the configured arrival times,
+with actual API latency for model execution.
 
 ### Legacy comparison scripts
 

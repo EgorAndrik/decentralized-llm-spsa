@@ -1,8 +1,10 @@
+import json
 import os
 import unittest
 from unittest import mock
 
-import requests
+import httpx
+from openai import RateLimitError
 
 from src import llm_api
 from src.llm_api import (
@@ -15,7 +17,7 @@ from src.llm_api import (
 )
 
 class EnvIsolated(unittest.TestCase):
-    """Run each test without LLM_* variables, so the result does not depend on the caller's environment.
+    """Run each test without API configuration inherited from the environment.
 
     CI sets LLM_MAX_CALLS=0 as a safety net against real calls; tests that
     drive a stubbed client must not inherit it.
@@ -25,30 +27,32 @@ class EnvIsolated(unittest.TestCase):
         patcher = mock.patch.dict(os.environ)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in [k for k in os.environ if k.startswith("LLM_")]:
+        for key in [k for k in os.environ if k.startswith("LLM_") or k == "GROQ_API_KEY"]:
             del os.environ[key]
+
+    def mock_http(self, handler):
+        def client(**kwargs):
+            return httpx.Client(transport=httpx.MockTransport(handler), **kwargs)
+
+        return mock.patch.object(llm_api, "HTTPClient", side_effect=client)
 
 
 GOOD = {"m": "https://api.groq.com/openai/v1"}
 KEYS = {"m": "k-config"}
 
 
-class FakeResponse:
-    def __init__(self, body=None, status=200, redirect=False):
-        self._body, self.status_code, self.is_redirect = body, status, redirect
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise requests.HTTPError(f"{self.status_code} error")
-
-    def json(self):
-        if isinstance(self._body, Exception):
-            raise self._body
-        return self._body
-
-
-def ok_body(text="hi"):
-    return {"choices": [{"message": {"content": text}}]}
+def ok_response(_request):
+    return httpx.Response(200, json={
+        "id": "completion",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "m",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "hi"},
+        }],
+    })
 
 
 class TestEndpointValidation(EnvIsolated):
@@ -97,24 +101,36 @@ class TestKeysFromEnvironment(EnvIsolated):
         client = LLMAPIClient({"a": self.OPENROUTER, "b": self.GROQ}, {"a": "x", "b": "groq-key"})
         seen = {}
 
-        def fake_post(url, json=None, headers=None, **kwargs):
-            seen[url] = headers["Authorization"]
-            return FakeResponse(ok_body())
+        def handle(request):
+            seen[str(request.url)] = request.headers["Authorization"]
+            return ok_response(request)
 
-        with mock.patch.dict(os.environ, {"LLM_API_KEY": "or-key"}), \
-                mock.patch.object(requests, "post", side_effect=fake_post):
+        with mock.patch.dict(os.environ, {"LLM_API_KEY": "or-key"}), self.mock_http(handle):
             client.call("a", "p", "t")
             client.call("b", "p", "t")
         self.assertEqual(seen[self.OPENROUTER + "/chat/completions"], "Bearer or-key")
         self.assertEqual(seen[self.GROQ + "/chat/completions"], "Bearer groq-key")
 
-    def test_environment_key_is_sent_in_header(self):
-        client = LLMAPIClient(GOOD, KEYS)
-        with mock.patch.dict(os.environ, {"LLM_API_KEY_M": "from-env"}), \
-                mock.patch.object(requests, "post", return_value=FakeResponse(ok_body())) as post:
-            client.call("m", "p", "t")
-        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer from-env")
-        self.assertFalse(post.call_args.kwargs["allow_redirects"])
+    def test_environment_key_and_model_alias_are_sent_to_chat_endpoint(self):
+        client = LLMAPIClient(GOOD, KEYS, model_aliases={"m": "vendor/model"}, max_tokens_per_model={"m": 100})
+        handler = mock.Mock(side_effect=ok_response)
+        with mock.patch.dict(os.environ, {"LLM_API_KEY_M": "from-env"}), self.mock_http(handler):
+            result = client.call("m", "p", "t")
+        request = handler.call_args.args[0]
+        self.assertEqual(str(request.url), self.GROQ + "/chat/completions")
+        self.assertEqual(request.headers["Authorization"], "Bearer from-env")
+        payload = json.loads(request.content)
+        self.assertEqual(payload["model"], "vendor/model")
+        self.assertEqual(payload["max_tokens"], 100)
+        self.assertEqual(payload["messages"][-1], {"role": "user", "content": "p"})
+        self.assertEqual(result["output"], "hi")
+        self.assertTrue(result["success"])
+
+    def test_groq_key_is_only_used_for_groq(self):
+        with mock.patch.dict(os.environ, {"GROQ_API_KEY": "groq-key"}):
+            self.assertEqual(api_key_from_env("m", None, self.GROQ), "groq-key")
+            self.assertIsNone(api_key_from_env("m", None, self.OPENROUTER))
+            self.assertIsNone(api_key_from_env("m", None, "https://api.deepseek.com/v1"))
 
 
 class TestConfigModuleAllowlist(EnvIsolated):
@@ -131,12 +147,13 @@ class TestConfigModuleAllowlist(EnvIsolated):
 class TestBudgetAndResponses(EnvIsolated):
     def test_budget_stops_before_the_request(self):
         client = LLMAPIClient(GOOD, KEYS, max_calls=2)
-        with mock.patch.object(requests, "post", return_value=FakeResponse(ok_body())) as post:
+        handler = mock.Mock(side_effect=ok_response)
+        with self.mock_http(handler):
             client.call("m", "p", "t")
             client.call("m", "p", "t")
             with self.assertRaises(BudgetExceeded):
                 client.call("m", "p", "t")
-        self.assertEqual(post.call_count, 2)
+        self.assertEqual(handler.call_count, 2)
         self.assertEqual(client.calls_made, 2)
 
     def test_budget_from_environment(self):
@@ -146,17 +163,29 @@ class TestBudgetAndResponses(EnvIsolated):
 
     def test_malformed_responses_raise_clear_error(self):
         client = LLMAPIClient(GOOD, KEYS)
-        for body in ({}, {"choices": []}, {"choices": [{"message": {"content": None}}]},
-                     {"choices": [{"message": {"content": 5}}]}, ValueError("not json"), "text"):
-            with mock.patch.object(requests, "post", return_value=FakeResponse(body)):
+        for body in (b'{}', b'{"choices":[]}', b'{"choices":[{"message":{"content":null}}]}',
+                     b'{"choices":[{"message":{"content":5}}]}', b"not json", b'"text"'):
+            with self.mock_http(lambda request: httpx.Response(200, content=body)):
                 with self.assertRaises(LLMResponseError, msg=repr(body)):
                     client.call("m", "p", "t")
 
     def test_redirect_is_not_followed(self):
         client = LLMAPIClient(GOOD, KEYS)
-        with mock.patch.object(requests, "post", return_value=FakeResponse({}, status=302, redirect=True)):
+        handler = mock.Mock(return_value=httpx.Response(302, headers={"Location": "https://evil.example/"}))
+        with self.mock_http(handler):
             with self.assertRaises(LLMResponseError):
                 client.call("m", "p", "t")
+        handler.assert_called_once()
+
+    def test_sdk_does_not_retry_outside_the_request_budget(self):
+        client = LLMAPIClient(GOOD, KEYS, max_calls=1)
+        handler = mock.Mock(return_value=httpx.Response(429, json={"error": {"message": "Rate limited"}}))
+        with self.mock_http(handler):
+            with self.assertRaises(RateLimitError):
+                client.call("m", "p", "t")
+            with self.assertRaises(BudgetExceeded):
+                client.call("m", "p", "t")
+        handler.assert_called_once()
 
     def test_budget_exceeded_is_not_swallowed_by_callers(self):
         from src.run_real_llm_comparison import PromptCachingLLMClient

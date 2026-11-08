@@ -3,9 +3,13 @@ import logging
 import os
 import re
 import time
-import requests
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
+
+from httpx import Client as HTTPClient, Response
+from langchain_openai import ChatOpenAI
+from langsmith import tracing_context
+from openai import APIConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +51,7 @@ def validate_endpoint(base_url: str, allowed_hosts) -> None:
 
 
 def api_key_from_env(model_name: str, configured: Optional[str], base_url: Optional[str] = None) -> Optional[str]:
-    """Key for a model, in order: LLM_API_KEY_<MODEL>, LLM_API_KEY (OpenRouter models only), the config value.
+    """Prefer the model-specific key, then the provider key, then the config value.
 
     The model name is upper-cased with non-alphanumerics replaced by '_',
     e.g. "qwen2.5-72b-instruct" -> LLM_API_KEY_QWEN2_5_72B_INSTRUCT.
@@ -59,6 +63,8 @@ def api_key_from_env(model_name: str, configured: Optional[str], base_url: Optio
     if specific:
         return specific
     host = (urlparse(base_url).hostname or "").lower() if base_url else ""
+    if host == "api.groq.com" and os.environ.get("GROQ_API_KEY"):
+        return os.environ["GROQ_API_KEY"]
     if host == "openrouter.ai" and os.environ.get("LLM_API_KEY"):
         return os.environ["LLM_API_KEY"]
     return configured
@@ -80,24 +86,31 @@ def import_config_module(config_name: str, package: Optional[str]):
     return importlib.import_module(config_name)
 
 
-class LLMAPIClient:
-    """
-    OpenAI-compatible chat completions client.
+def _validate_chat_response(response: Response) -> None:
+    """Check the wire response before LangChain normalizes missing content."""
+    if response.has_redirect_location:
+        raise LLMResponseError("Unexpected redirect from the LLM endpoint")
+    if not response.is_success:
+        return
+    try:
+        response.read()
+        content = response.json()["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise LLMResponseError("Provider response is not a chat completion") from None
+    if not isinstance(content, str):
+        raise LLMResponseError("Provider completion content is not text")
 
-    Works with any provider that implements /v1/chat/completions:
-      - OpenRouter  (one key for all models)
-      - Groq        (Llama, Mistral — free tier available)
-      - Together AI (Qwen, Llama, DeepSeek)
-      - DeepSeek    (deepseek-coder, deepseek-chat)
-      - Mistral AI  (mistral-7b, mixtral)
+
+class LLMAPIClient:
+    """LangChain client for endpoints implementing OpenAI Chat Completions.
 
     Parameters
     ----------
     endpoints : {model_name: base_url}
-        Base URL up to /v1, e.g. "https://openrouter.ai/api/v1".
-        For OpenRouter you can point every model at the same URL.
+        Base URL before /chat/completions, e.g. "https://api.groq.com/openai/v1".
+        Models served by the same provider can share a URL and key.
     api_keys : {model_name: key}
-        API keys per model. For OpenRouter all keys are identical.
+        Optional configured API keys per model, used after environment keys.
     model_aliases : {model_name: remote_model_id}, optional
         Maps internal model names to provider model IDs, e.g.
         {"llama3-8b-instruct": "meta-llama/llama-3-8b-instruct"}.
@@ -148,7 +161,7 @@ class LLMAPIClient:
         Send a chat completion request. Returns:
             {"output": str, "success": bool, "latency": float}
         Raises ValueError if the model is not configured.
-        Raises requests.HTTPError on non-2xx responses.
+        Provider HTTP failures propagate as SDK errors.
         """
         base_url = self.endpoints.get(model_name)
         api_key = api_key_from_env(model_name, self.api_keys.get(model_name), base_url)
@@ -159,44 +172,45 @@ class LLMAPIClient:
             )
 
         validate_endpoint(base_url, self.allowed_hosts)
-        remote_model = self.model_aliases.get(model_name, model_name)
-        url = base_url.rstrip("/") + "/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": remote_model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant. Respond in plain text only. Do not call any functions or tools."},
-                {"role": "user", "content": prompt},
-            ],
-            "max_tokens": self.max_tokens_per_model.get(model_name, self.max_tokens),
-        }
-
         if self.max_calls is not None and self.calls_made >= self.max_calls:
             raise BudgetExceeded(
                 f"API call budget of {self.max_calls} requests is exhausted "
                 "(raise it with max_calls or LLM_MAX_CALLS)."
             )
-        self.calls_made += 1
+        with HTTPClient(
+            follow_redirects=False,
+            event_hooks={"response": [_validate_chat_response]},
+        ) as http_client:
+            model = ChatOpenAI(
+                model=self.model_aliases.get(model_name, model_name),
+                base_url=base_url.rstrip("/"),
+                api_key=api_key,
+                timeout=self.timeout,
+                http_client=http_client,
+                use_responses_api=False,
+                max_retries=0,
+                cache=False,
+                # Preserve the Chat Completions token field used by existing endpoints.
+                extra_body={"max_tokens": self.max_tokens_per_model.get(model_name, self.max_tokens)},
+            )
+            messages = [
+                ("system", "You are a helpful assistant. Respond in plain text only. Do not call any functions or tools."),
+                ("human", prompt),
+            ]
+            self.calls_made += 1
+            t0 = time.perf_counter()
+            try:
+                with tracing_context(enabled=False):
+                    response = model.invoke(messages)
+            except APIConnectionError as exc:
+                if isinstance(exc.__cause__, LLMResponseError):
+                    raise exc.__cause__ from None
+                raise
+            latency = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        # Redirects are not followed: the Authorization header must not leave the validated host.
-        response = requests.post(
-            url, json=payload, headers=headers, timeout=self.timeout, allow_redirects=False,
-        )
-        latency = time.perf_counter() - t0
-
-        response.raise_for_status()
-        if response.is_redirect:
-            raise LLMResponseError(f"{model_name}: unexpected redirect to another location")
-        try:
-            content = response.json()["choices"][0]["message"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise LLMResponseError(f"{model_name}: response is not a chat completion ({type(exc).__name__})") from None
+        content = response.content
         if not isinstance(content, str):
-            raise LLMResponseError(f"{model_name}: completion content is {type(content).__name__}, not text")
+            raise LLMResponseError(f"{model_name}: completion content is not text")
         return {
             "output": content,
             "success": True,
