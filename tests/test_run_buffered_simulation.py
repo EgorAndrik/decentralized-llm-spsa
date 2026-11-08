@@ -160,10 +160,10 @@ def test_interrupt_clears_previous_run_responses(tmp_path, monkeypatch):
     assert not (tmp_path / "responses.jsonl").read_text()
 
 
-def test_failed_worker_calls_miss_deadlines_and_return_error(tmp_path, monkeypatch):
-    db = tmp_path / "knowledge.sqlite3"
+def test_failed_worker_calls_miss_deadlines_and_return_error(tmp_path, monkeypatch, knowledge_dsn):
+    monkeypatch.setenv("ROUTING_DATABASE_URL", knowledge_dsn)
     calls = configure_api_run(
-        tmp_path, monkeypatch, ["--tasks", "2", "--knowledge-db", str(db)], worker_fails=True,
+        tmp_path, monkeypatch, ["--tasks", "2", "--knowledge-db"], worker_fails=True,
     )
 
     with pytest.raises(SystemExit) as error:
@@ -183,8 +183,9 @@ def test_failed_worker_calls_miss_deadlines_and_return_error(tmp_path, monkeypat
     assert not (tmp_path / "responses.jsonl").read_text()
 
 
-def test_mvp_prompt_requires_completed_rounds_from_persistent_knowledge(tmp_path, monkeypatch, capsys):
-    db_args = ["--knowledge-db", str(tmp_path / "knowledge.sqlite3"), "--controllers", "2"]
+def test_mvp_prompt_requires_completed_rounds_from_persistent_knowledge(tmp_path, monkeypatch, capsys, knowledge_dsn):
+    monkeypatch.setenv("ROUTING_DATABASE_URL", knowledge_dsn)
+    db_args = ["--knowledge-db", "--controllers", "2"]
     warmup_file = tmp_path / "prompts.txt"
     warmup_file.write_text("Explain SQL joins.\n")
     warmup_args = [*db_args, "--warmup-file", str(warmup_file)]
@@ -235,9 +236,10 @@ def test_web_search_requires_key_before_contacting_providers(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("max_calls", [1, 2])
-def test_tavily_routes_search_via_buffer_and_shares_api_budget(tmp_path, monkeypatch, capsys, max_calls):
+def test_tavily_routes_search_via_buffer_and_shares_api_budget(tmp_path, monkeypatch, capsys, max_calls, knowledge_dsn):
     prompt = "Find the official Python TaskGroup docs."
-    db_args = ["--knowledge-db", str(tmp_path / "routing.sqlite3")]
+    monkeypatch.setenv("ROUTING_DATABASE_URL", knowledge_dsn)
+    db_args = ["--knowledge-db"]
     verdict = '{"quality_score": 0.95, "verdict": "pass"}'
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     configure_api_run(

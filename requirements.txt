@@ -5,6 +5,7 @@ scipy>=1.13,<2
 plotly>=5.0,<7
 catboost>=1.2,<2
 httpx>=0.27,<1
+psycopg[binary]>=3.2,<4
 langchain-openai>=1.0,<2
 langsmith>=0.3,<1
 openai>=1.109,<4

@@ -7,13 +7,13 @@ import hashlib
 import json
 import math
 import os
-import sqlite3
 import time
 from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import psycopg
 
 from .buffered_orchestrator import BufferedOrchestrator
 from .llm_api import BudgetExceeded, LLMAPIClient, api_key_from_env, import_config_module
@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="llm_config", help="API config module (llm_config*).")
     parser.add_argument("--prompt", help="Run one user prompt in API mode instead of the generated workload.")
     parser.add_argument("--web-search", action="store_true", help="Route the prompt to Tavily (requires TAVILY_API_KEY).")
-    parser.add_argument("--knowledge-db", type=Path, help="Persist routing experience in this SQLite file.")
+    parser.add_argument("--knowledge-db", action="store_true", help="Persist routing experience using ROUTING_DATABASE_URL (PostgreSQL).")
     parser.add_argument("--round-size", type=int, help="Evaluated tasks per knowledge round (default: 5).")
     parser.add_argument("--mvp-rounds", type=int, help="Completed rounds before serving prompts (default: 3).")
     parser.add_argument("--warmup-file", type=Path, help="UTF-8 file with one warm-up prompt per non-empty line.")
@@ -107,18 +107,15 @@ def main() -> None:
         parser.error("--tasks must be positive")
     if args.batch_size < 1 or not math.isfinite(args.tick_duration) or args.tick_duration <= 0:
         parser.error("--batch-size and --tick-duration must be positive and finite")
-    if args.knowledge_db is None and (args.round_size is not None or args.mvp_rounds is not None):
+    if not args.knowledge_db and (args.round_size is not None or args.mvp_rounds is not None):
         parser.error("--round-size and --mvp-rounds require --knowledge-db")
-    if args.knowledge_db is not None:
-        report_names = ("summary.csv", "task_records.csv", "event_records.csv", "feedback_records.csv", "responses.jsonl")
-        if any(args.knowledge_db.resolve() == (args.output_dir / name).resolve() for name in report_names):
-            parser.error("--knowledge-db must point to a separate file from the run reports")
-    if args.prompt is not None and args.knowledge_db is not None and not args.knowledge_db.is_file():
-        parser.error("The knowledge database does not exist. Run the warm-up tasks first.")
+    knowledge_dsn = os.environ.get("ROUTING_DATABASE_URL", "").strip() if args.knowledge_db else ""
+    if args.knowledge_db and not knowledge_dsn:
+        parser.error("Set ROUTING_DATABASE_URL to use --knowledge-db")
 
     warmup_prompts = []
     if args.warmup_file is not None:
-        if args.knowledge_db is None or args.prompt is not None:
+        if not args.knowledge_db or args.prompt is not None:
             parser.error("--warmup-file requires --knowledge-db and cannot be combined with --prompt")
         try:
             warmup_prompts = [
@@ -130,11 +127,11 @@ def main() -> None:
             parser.error("Warm-up file must contain at least one prompt")
         warmup_prompts = warmup_prompts[:args.tasks]
     with ExitStack() as resources:
-        run_configured(args, parser, resources, warmup_prompts)
+        run_configured(args, parser, resources, warmup_prompts, knowledge_dsn)
 
 
 def run_configured(
-    args: argparse.Namespace, parser: argparse.ArgumentParser, resources: ExitStack, warmup_prompts: list[str],
+    args: argparse.Namespace, parser: argparse.ArgumentParser, resources: ExitStack, warmup_prompts: list[str], knowledge_dsn: str,
 ) -> None:
     tavily_key = os.environ.get("TAVILY_API_KEY", "").strip() if args.mode == "api" else ""
     if args.web_search and not tavily_key:
@@ -153,7 +150,7 @@ def run_configured(
             api_options["search_agent"] = TavilySearchAgent(tavily_key, reserve_call=client.reserve_call)
 
     knowledge = None
-    if args.knowledge_db is not None:
+    if knowledge_dsn:
         agent_names = [profile.model_name for profile in PROFILES[:args.agents]]
         scope = {"mode": args.mode, "controllers": args.controllers, "agents": agent_names}
         # The optional search worker reserves the slot after these LLMs. Its
@@ -170,7 +167,7 @@ def run_configured(
             scope["judge"] = judge_model
         try:
             knowledge = RoutingKnowledge(
-                args.knowledge_db, scope, round_size=args.round_size, mvp_rounds=args.mvp_rounds,
+                knowledge_dsn, scope, round_size=args.round_size, mvp_rounds=args.mvp_rounds,
             )
             resources.callback(knowledge.close)
             if args.prompt is not None and not knowledge.ready:
@@ -180,7 +177,10 @@ def run_configured(
                     f"{len(agents)}/{args.agents} agents, {len(controllers)}/{args.controllers} controllers, "
                     f"{prompts}/2 distinct prompts. Coverage is checked at the end of a round."
                 )
-        except (OSError, sqlite3.Error, ValueError) as exc:
+        except psycopg.Error as exc:
+            write_reports(args.output_dir, None, {"mode": args.mode, "run_status": "failed"}, args.mode)
+            parser.error(f"Knowledge database: PostgreSQL setup failed ({type(exc).__name__}). Check the connection and permissions.")
+        except ValueError as exc:
             write_reports(args.output_dir, None, {"mode": args.mode, "run_status": "failed"}, args.mode)
             parser.error(f"Knowledge database: {exc}")
 
@@ -227,7 +227,11 @@ def run_configured(
     started = time.perf_counter()
     try:
         summary = orchestrator.run(tasks)
-    except (BudgetExceeded, JudgeEvaluationError, sqlite3.Error) as exc:
+    except psycopg.Error as exc:
+        summary = orchestrator.collect_summary(include_knowledge=False)
+        error = f"Knowledge database: PostgreSQL operation failed ({type(exc).__name__})."
+        status = "failed"
+    except (BudgetExceeded, JudgeEvaluationError) as exc:
         summary = orchestrator.collect_summary()
         error = str(exc)
         status = "failed"
