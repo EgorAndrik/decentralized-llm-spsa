@@ -14,10 +14,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import psycopg
+from dotenv import load_dotenv
 
 from .buffered_orchestrator import BufferedOrchestrator
 from .llm_api import BudgetExceeded, LLMAPIClient, api_key_from_env, import_config_module
-from .main import PROFILES, JudgeEvaluationError, SemanticFeatureExtractor, SimulationVariant, Task, TaskType
+from .main import AgentProfile, PROFILES, JudgeEvaluationError, SemanticFeatureExtractor, SimulationVariant, Task, TaskType
 from .routing_knowledge import RoutingKnowledge
 from .tavily_search import TavilySearchAgent
 
@@ -25,7 +26,7 @@ from .tavily_search import TavilySearchAgent
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the global buffer in simulation or API mode.")
     parser.add_argument("--mode", choices=("simulation", "api"), default="simulation")
-    parser.add_argument("--config", default="llm_config", help="API config module (llm_config*).")
+    parser.add_argument("--config", help="Use a Python API config module (llm_config*) instead of LLM_MODELS.")
     parser.add_argument("--prompt", help="Run one user prompt in API mode instead of the generated workload.")
     parser.add_argument("--web-search", action="store_true", help="Route the prompt to Tavily (requires TAVILY_API_KEY).")
     parser.add_argument("--knowledge-db", action="store_true", help="Persist routing experience using ROUTING_DATABASE_URL (PostgreSQL).")
@@ -33,8 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mvp-rounds", type=int, help="Completed rounds before serving prompts (default: 3).")
     parser.add_argument("--warmup-file", type=Path, help="UTF-8 file with one warm-up prompt per non-empty line.")
     parser.add_argument("--tasks", type=int, help="Generated task count (simulation: 200, API: 1 by default).")
-    parser.add_argument("--controllers", type=int, default=3)
-    parser.add_argument("--agents", type=int, default=5)
+    parser.add_argument("--controllers", type=int, help="Number of controllers (default: ROUTING_CONTROLLERS or 3).")
+    parser.add_argument("--agents", type=int, help="Number of agents (default: all LLM_MODELS, or 5 with built-in profiles).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=5)
     parser.add_argument("--tick-duration", type=float, default=1.0)
@@ -58,6 +59,32 @@ def load_api_client(config_name: str, agent_count: int) -> tuple[LLMAPIClient, s
         endpoints, keys, model_aliases=getattr(cfg, "LLM_MODEL_ALIASES", {}),
         max_tokens_per_model=getattr(cfg, "MAX_TOKENS_PER_MODEL", {}),
         token_prices=getattr(cfg, "LLM_TOKEN_PRICES", {}),
+    ), judge
+
+
+def load_env_api_client(models: list[str]) -> tuple[LLMAPIClient, str]:
+    endpoint = os.environ.get("LLM_BASE_URL", "").strip()
+    judge = os.environ.get("LLM_JUDGE_MODEL", "").strip()
+    if not endpoint or not judge:
+        raise ValueError("Set LLM_BASE_URL and LLM_JUDGE_MODEL when using LLM_MODELS.")
+
+    endpoints = dict.fromkeys([*models, judge], endpoint)
+    shared_key = os.environ.get("API_KEY") or os.environ.get("LLM_PROVIDER_API_KEY")
+    for name in endpoints:
+        if not api_key_from_env(name, None, endpoint, shared_key=shared_key):
+            raise ValueError(f"Missing API key for {name!r}. Set API_KEY or a model-specific key.")
+    try:
+        prices = json.loads(os.environ.get("LLM_TOKEN_PRICES", "{}"))
+        max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "512"))
+        timeout = int(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
+    except ValueError:
+        raise ValueError("Expected JSON in LLM_TOKEN_PRICES and integers for LLM_MAX_TOKENS and LLM_TIMEOUT_SECONDS.") from None
+    if not isinstance(prices, dict):
+        raise ValueError("LLM_TOKEN_PRICES must be a JSON object keyed by model ID.")
+    if max_tokens < 1 or timeout < 1:
+        raise ValueError("LLM_MAX_TOKENS and LLM_TIMEOUT_SECONDS must be positive.")
+    return LLMAPIClient(
+        endpoints, {}, token_prices=prices, max_tokens=max_tokens, timeout=timeout, shared_key=shared_key,
     ), judge
 
 
@@ -95,10 +122,6 @@ def write_reports(output_dir: Path, orchestrator: BufferedOrchestrator | None, s
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    if not 1 <= args.agents <= len(PROFILES):
-        parser.error(f"--agents must be between 1 and {len(PROFILES)}")
-    if args.controllers < 1:
-        parser.error("--controllers must be positive")
     if args.prompt is not None and (args.mode != "api" or not args.prompt.strip()):
         parser.error("--prompt requires API mode and a non-empty prompt")
     if args.web_search and (args.mode != "api" or args.prompt is None):
@@ -109,6 +132,31 @@ def main() -> None:
         parser.error("--batch-size and --tick-duration must be positive and finite")
     if not args.knowledge_db and (args.round_size is not None or args.mvp_rounds is not None):
         parser.error("--round-size and --mvp-rounds require --knowledge-db")
+    load_dotenv(Path.cwd() / ".env", override=False)
+    if args.controllers is None:
+        try:
+            args.controllers = int(os.environ.get("ROUTING_CONTROLLERS", "3"))
+        except ValueError:
+            parser.error("ROUTING_CONTROLLERS must be a positive integer")
+    if args.controllers < 1:
+        parser.error("--controllers and ROUTING_CONTROLLERS must be positive")
+    env_models = os.environ.get("LLM_MODELS") if args.mode == "api" and args.config is None else None
+    profiles = PROFILES
+    if env_models is not None:
+        models = [model.strip() for model in env_models.split(",")]
+        if not all(models) or len(models) != len(set(models)):
+            parser.error("LLM_MODELS must be a comma-separated list of distinct, non-empty model IDs.")
+        profiles = [
+            AgentProfile(i, model, model, np.full(len(TaskType), 0.5), np.ones(len(TaskType)),
+                         np.full(len(TaskType), 1.0 / len(TaskType)))
+            for i, model in enumerate(models)
+        ]
+    if args.agents is None:
+        args.agents = len(profiles) if env_models is not None else 5
+    if not 1 <= args.agents <= len(profiles):
+        parser.error(f"--agents must be between 1 and {len(profiles)}")
+    if env_models is not None:
+        profiles = profiles[:args.agents]
     knowledge_dsn = os.environ.get("ROUTING_DATABASE_URL", "").strip() if args.knowledge_db else ""
     if args.knowledge_db and not knowledge_dsn:
         parser.error("Set ROUTING_DATABASE_URL to use --knowledge-db")
@@ -127,11 +175,12 @@ def main() -> None:
             parser.error("Warm-up file must contain at least one prompt")
         warmup_prompts = warmup_prompts[:args.tasks]
     with ExitStack() as resources:
-        run_configured(args, parser, resources, warmup_prompts, knowledge_dsn)
+        run_configured(args, parser, resources, warmup_prompts, knowledge_dsn, profiles, env_models is not None)
 
 
 def run_configured(
     args: argparse.Namespace, parser: argparse.ArgumentParser, resources: ExitStack, warmup_prompts: list[str], knowledge_dsn: str,
+    profiles: list[AgentProfile], use_env_models: bool,
 ) -> None:
     tavily_key = os.environ.get("TAVILY_API_KEY", "").strip() if args.mode == "api" else ""
     if args.web_search and not tavily_key:
@@ -139,9 +188,13 @@ def run_configured(
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_reports(args.output_dir, None, {"mode": args.mode, "run_status": "running"}, args.mode)
     api_options = {}
+    agent_names = [profile.model_name for profile in profiles[:args.agents]]
     if args.mode == "api":
         try:
-            client, judge_model = load_api_client(args.config, args.agents)
+            if use_env_models:
+                client, judge_model = load_env_api_client(agent_names)
+            else:
+                client, judge_model = load_api_client(args.config or "llm_config", args.agents)
         except (ImportError, ValueError) as exc:
             write_reports(args.output_dir, None, {"mode": args.mode, "run_status": "failed"}, args.mode)
             parser.error(f"API configuration: {exc}")
@@ -151,7 +204,6 @@ def run_configured(
 
     knowledge = None
     if knowledge_dsn:
-        agent_names = [profile.model_name for profile in PROFILES[:args.agents]]
         scope = {"mode": args.mode, "controllers": args.controllers, "agents": agent_names}
         # The optional search worker reserves the slot after these LLMs. Its
         # WEB_SEARCH experience can safely coexist in an existing database.
@@ -200,6 +252,7 @@ def run_configured(
         simulation_tick=args.tick_duration if args.mode == "simulation" else None,
         classifier_seed=args.seed,
         knowledge=knowledge,
+        agent_profiles=profiles,
         **api_options,
     )
     if args.prompt is None and not warmup_prompts:
