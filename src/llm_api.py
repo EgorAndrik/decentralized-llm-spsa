@@ -51,8 +51,14 @@ def validate_endpoint(base_url: str, allowed_hosts) -> None:
     )
 
 
-def api_key_from_env(model_name: str, configured: Optional[str], base_url: Optional[str] = None) -> Optional[str]:
-    """Prefer the model-specific key, then the provider key, then the config value.
+def api_key_from_env(
+    model_name: str,
+    configured: Optional[str],
+    base_url: Optional[str] = None,
+    *,
+    shared_key: Optional[str] = None,
+) -> Optional[str]:
+    """Prefer the model-specific key, then the shared, provider and config keys.
 
     The model name is upper-cased with non-alphanumerics replaced by '_',
     e.g. "qwen2.5-72b-instruct" -> LLM_API_KEY_QWEN2_5_72B_INSTRUCT.
@@ -63,6 +69,8 @@ def api_key_from_env(model_name: str, configured: Optional[str], base_url: Optio
     specific = os.environ.get(f"LLM_API_KEY_{suffix}")
     if specific:
         return specific
+    if shared_key:
+        return shared_key
     host = (urlparse(base_url).hostname or "").lower() if base_url else ""
     if host == "api.groq.com" and os.environ.get("GROQ_API_KEY"):
         return os.environ["GROQ_API_KEY"]
@@ -140,6 +148,8 @@ class LLMAPIClient:
         allowed_hosts=None,
         max_calls: Optional[int] = None,
         token_prices: Optional[Dict[str, Tuple[float, float]]] = None,
+        *,
+        shared_key: Optional[str] = None,
     ):
         hosts = set(DEFAULT_ALLOWED_HOSTS) | {h.strip().lower() for h in (allowed_hosts or ()) if h.strip()}
         hosts |= {h.strip().lower() for h in os.environ.get("LLM_ALLOWED_HOSTS", "").split(",") if h.strip()}
@@ -155,6 +165,7 @@ class LLMAPIClient:
         self.calls_made = 0
         self.endpoints = endpoints
         self.api_keys = api_keys
+        self.shared_key = shared_key
         self.model_aliases = model_aliases or {}
         # Prices are USD per million input and output tokens, keyed by provider model ID.
         self.token_prices = {}
@@ -187,7 +198,7 @@ class LLMAPIClient:
         Provider HTTP failures propagate as SDK errors.
         """
         base_url = self.endpoints.get(model_name)
-        api_key = api_key_from_env(model_name, self.api_keys.get(model_name), base_url)
+        api_key = api_key_from_env(model_name, self.api_keys.get(model_name), base_url, shared_key=self.shared_key)
         if not base_url or not api_key:
             raise ValueError(
                 f"Model '{model_name}' is not configured. "

@@ -67,23 +67,41 @@ Chat Completions. Configure the base URL (without `/chat/completions`), the
 provider's model IDs and API credentials. No provider-specific Python SDK is
 needed to add another compatible endpoint.
 
-The example config maps the first two agent profiles to Groq models. To try
-that configuration with a small API run:
+From the repository root, copy `.env.example` to `.env` and fill in
+`API_KEY`. Set `LLM_MODELS` to a comma-separated list of executor
+model IDs and `LLM_JUDGE_MODEL` to the judge's ID. All listed executors
+enter the candidate pool by default. To use only the first N, pass
+`--agents N`. Each executor starts with the same routing priors.
+Set `ROUTING_CONTROLLERS` in `.env` to choose the controller count in
+either mode (default: 3). The `--controllers` flag takes precedence.
+Each task's assigned controller scores the eligible executors from the shared model pool.
+Exported environment variables take precedence over `.env`, which Git ignores.
 
 ```bash
-cp src/llm_config_example.py src/llm_config.py
-export GROQ_API_KEY="gsk_..."
-LLM_MAX_CALLS=10 python -m src.run_buffered_simulation --mode api --agents 2 --tasks 2
+cp .env.example .env
+# Fill in API_KEY in .env, then run:
+python -m src.run_buffered_simulation --mode api \
+       --output-dir buffered_outputs/smoke-sql \
+       --prompt "In SQL, a column has values 10, NULL, and 20. What do COUNT(*) and COUNT(column) return?"
 ```
 
-For a different endpoint, update `LLM_ENDPOINTS` and `LLM_MODEL_ALIASES` in
-`src/llm_config.py`. Use `LLM_API_KEY_<INTERNAL_NAME>` for a per-model
-credential (for example, `LLM_API_KEY_LLAMA3_8B_INSTRUCT`), or populate
-`LLM_API_KEYS` from your provider's environment variable. Add a trusted
-HTTPS hostname via `LLM_ALLOWED_HOSTS` if it is not already allowed.
-For comparison runs, configure every agent profile the runner uses. The
-two-agent example reuses one worker model as the judge to demonstrate the
-connection.
+Expect `COUNT(*) = 3` and `COUNT(column) = 2`. Another check is to ask
+`What does Python's sorted([3, 1, 3, 2]) return?` and expect `[1, 2, 3, 3]`.
+Use a different `--output-dir` for each case to retain its reports.
+The template caps each run at two outgoing requests, one for the worker
+and one for the judge. Increase `LLM_MAX_CALLS` for multi-task runs.
+
+In `.env`, all workers and the judge use `LLM_BASE_URL` and `API_KEY`.
+For another OpenAI-compatible provider, change the endpoint, key and model IDs.
+Add its trusted HTTPS hostname to
+`LLM_ALLOWED_HOSTS` if needed. For per-model credentials, use
+`LLM_API_KEY_<MODEL_ID>` with the model ID uppercased and punctuation
+replaced with underscores, such as `LLM_API_KEY_OPENAI_GPT_OSS_20B`.
+The template also shows optional timeout, token limit and pricing settings.
+
+For setups with multiple endpoints, use a Python config via
+`--config llm_config`. When `LLM_MODELS` is absent, the existing
+`src/llm_config.py` is the default.
 
 ## Reproducing Results
 
@@ -158,7 +176,7 @@ estimate. It omits the price comparison when a candidate's rate is unknown.
 
 #### Optional Tavily web search
 
-Set `TAVILY_API_KEY` in the environment to add a separate search worker in
+Set `TAVILY_API_KEY` in `.env` or in the environment to add a separate search worker in
 API mode. Tasks tagged with `--web-search` use that worker. The controller
 and global buffer still handle assignment, and the configured judge scores
 the answer and source excerpts. The search worker is separate from the
@@ -167,10 +185,13 @@ LLM agents counted by `--agents`.
 With the API configuration above in place:
 
 ```bash
-export TAVILY_API_KEY="tvly-..."
-LLM_MAX_CALLS=2 python -m src.run_buffered_simulation --mode api --agents 2 \
+LLM_MAX_CALLS=2 python -m src.run_buffered_simulation --mode api \
+       --output-dir buffered_outputs/smoke-search \
        --web-search --prompt "Find the official Python documentation for asyncio.TaskGroup."
 ```
+
+Check that the answer cites an official `docs.python.org` page and explains
+that the context manager waits for its tasks before exiting.
 
 Ordinary prompts and simulation send no requests to Tavily. A search
 request without a key exits with a configuration error. Search calls share

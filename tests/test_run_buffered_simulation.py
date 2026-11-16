@@ -14,6 +14,14 @@ def read_rows(path):
         return list(csv.DictReader(file))
 
 
+@pytest.fixture(autouse=True)
+def isolate_dotenv(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LLM_MODELS", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.delenv("ROUTING_CONTROLLERS", raising=False)
+
+
 def test_default_mode_does_not_load_api_config(tmp_path, monkeypatch):
     def unexpected_api_config(*args):
         pytest.fail("Simulation should not load API configuration")
@@ -30,11 +38,13 @@ def test_default_mode_does_not_load_api_config(tmp_path, monkeypatch):
     assert not (tmp_path / "responses.jsonl").exists()
 
 
-def configure_api_run(tmp_path, monkeypatch, args, *, judge_output=None, worker_fails=False):
+def configure_api_run(tmp_path, monkeypatch, args, *, judge_output=None, worker_fails=False, expected_key=None):
     calls = []
 
     def respond(request):
         assert str(request.url) == llm_config_example.BASE_URL + "/chat/completions"
+        if expected_key is not None:
+            assert request.headers["Authorization"] == f"Bearer {expected_key}"
         body = json.loads(request.content)
         prompt = body["messages"][-1]["content"]
         is_judge = prompt.startswith("You are an LLM judge.")
@@ -63,6 +73,58 @@ def configure_api_run(tmp_path, monkeypatch, args, *, judge_output=None, worker_
         "runner", "--mode", "api", "--agents", "2", "--output-dir", str(tmp_path), *args,
     ])
     return calls
+
+
+def test_api_reads_dotenv_and_preserves_shell_budget(tmp_path, monkeypatch):
+    calls = configure_api_run(
+        tmp_path, monkeypatch, ["--prompt", "What is 2 + 2?"],
+        judge_output='{"quality_score": 0.95, "verdict": "pass"}', expected_key="dotenv-key",
+    )
+    monkeypatch.delenv("GROQ_API_KEY")
+    monkeypatch.delenv("LLM_API_KEY_LLAMA3_8B_INSTRUCT", raising=False)
+    monkeypatch.delenv("LLM_API_KEY_DEEPSEEK_CODER_V2", raising=False)
+    monkeypatch.delenv("LLM_API_KEY_JUDGE", raising=False)
+    (tmp_path / ".env").write_text("GROQ_API_KEY=dotenv-key\nLLM_MAX_CALLS=0\n", encoding="utf-8")
+
+    run_buffered_simulation.main()
+
+    assert len(calls) == 2
+    assert read_rows(tmp_path / "summary.csv")[0]["run_status"] == "completed"
+
+
+@pytest.mark.parametrize("controller_flags, expected_ids", [([], {0, 1}), (["--controllers", "3"], {0, 1, 2})])
+def test_api_uses_models_and_judge_from_dotenv(tmp_path, monkeypatch, controller_flags, expected_ids):
+    calls = configure_api_run(
+        tmp_path, monkeypatch, ["--tasks", "3", *controller_flags],
+        judge_output='{"quality_score": 0.95, "verdict": "pass"}', expected_key="shared-key",
+    )
+    argv = sys.argv.copy()
+    agent_flag = argv.index("--agents")
+    del argv[agent_flag:agent_flag + 2]
+    monkeypatch.setattr(sys, "argv", argv)
+    (tmp_path / ".env").write_text(
+        "LLM_BASE_URL=https://api.groq.com/openai/v1\n"
+        "API_KEY=shared-key\n"
+        "ROUTING_CONTROLLERS=2\n"
+        "LLM_MODELS=test/worker-a,test/worker-b,test/worker-c\n"
+        "LLM_JUDGE_MODEL=test/judge\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_config(*args):
+        pytest.fail("Env-configured runs should not load a Python config")
+
+    monkeypatch.setattr(run_buffered_simulation, "import_config_module", unexpected_config)
+    run_buffered_simulation.main()
+
+    workers = [model for model, _, is_judge in calls if not is_judge]
+    judges = [model for model, _, is_judge in calls if is_judge]
+    assert len(workers) == 3
+    assert set(workers) <= {"test/worker-a", "test/worker-b", "test/worker-c"}
+    assert judges == ["test/judge"] * 3
+    buffered = [row for row in read_rows(tmp_path / "event_records.csv") if row["event"] == "buffered"]
+    assert {int(float(row["controller_id"])) for row in buffered} == expected_ids
+    assert all(float(row["candidate_count"]) == 3 for row in buffered)
 
 
 def test_api_prompt_returns_answer_and_exports_usage(tmp_path, monkeypatch, capsys):

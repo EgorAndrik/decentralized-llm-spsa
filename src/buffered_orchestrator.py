@@ -79,6 +79,7 @@ class BufferedOrchestrator(ExactOrchestrator):
         strict_judge: bool = False,
         knowledge: RoutingKnowledge | None = None,
         search_agent: TavilySearchAgent | None = None,
+        agent_profiles: Sequence[AgentProfile] = PROFILES,
     ) -> None:
         variant = variant or SimulationVariant(
             name="global_buffer_aspsa",
@@ -93,12 +94,12 @@ class BufferedOrchestrator(ExactOrchestrator):
         )
         self.search_agent = search_agent
         self.search_agent_id = None
-        profiles = PROFILES
+        profiles = agent_profiles
         if search_agent is not None:
             if llm_api_client is None:
                 raise ValueError("Tavily search requires API mode.")
             self.search_agent_id = num_agents
-            profiles = [*PROFILES[:num_agents], AgentProfile(
+            profiles = [*profiles[:num_agents], AgentProfile(
                 id=num_agents,
                 name="Tavily Search",
                 model_name=search_agent.name,
